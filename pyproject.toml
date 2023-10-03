@@ -16,10 +16,13 @@ polars = "^0.19.3"
 tqdm = "^4.66.1"
 starplot = "^0.3.1"
 scipy = "^1.11.3"
+pyarrow = "^13.0.0"
 
 
 [tool.poetry.group.dev.dependencies]
 jupyter = "^1.0.0"
+jupyterlab-vim = "^4.0.3"
+nbdev = "^2.3.12"
 
 [build-system]
 requires = ["poetry-core"]
