@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "py-asterisms"
+name = "asterisms-py"
 version = "0.1.0"
 description = ""
 authors = ["Mike Rosseel <mike.rosseel@gmail.com>"]
