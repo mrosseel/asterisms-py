@@ -1,0 +1,9 @@
+project:
+  output-dir: _docs
+
+website:
+  title: "asterisms-py"
+  site-url: "https://mrosseel.github.io/asterisms-py"
+  description: "throwing polars and pytorch at asterisms searching"
+  repo-branch: main
+  repo-url: "https://github.com/mrosseel/asterisms-py"
