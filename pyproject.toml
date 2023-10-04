@@ -4,7 +4,7 @@ version = "0.1.0"
 description = ""
 authors = ["Mike Rosseel <mike.rosseel@gmail.com>"]
 readme = "README.md"
-packages = [{include = "py_asterisms"}]
+packages = [{include = "asterisms_py"}]
 
 [tool.poetry.dependencies]
 python = "3.11.5"
