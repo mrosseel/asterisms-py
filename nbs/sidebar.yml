@@ -5,8 +5,3 @@ website:
       - 00_tycho2_dat_to_parquet.ipynb
       - 01_polars+pytorch.ipynb
       - 02_processing_results.ipynb
-      - Untitled.ipynb
-      - metrics_testing.ipynb
-      - polars.ipynb
-      - starplot_orion.ipynb
-      - testing.ipynb
