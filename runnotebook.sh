@@ -1,2 +1,3 @@
 #!/bin/sh
-poetry run jupyter notebook &
+export PYTHONPATH=.:$PYTHONPATH
+uv run jupyter notebook &
