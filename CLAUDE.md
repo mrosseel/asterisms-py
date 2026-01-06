@@ -40,33 +40,30 @@ uv run nbdev_export
 
 Uses uv for fast, reliable Python package management. Dependencies are specified in `pyproject.toml` using standard PEP 621 format.
 
-**PyTorch Installation (AMD Strix Halo/ROCm on NixOS):**
-PyTorch is not included in standard dependencies due to platform-specific requirements.
+**PyTorch Installation (AMD Strix Halo on NixOS):**
 
-On NixOS, use the provided Nix shell for ROCm support:
+⚠️ **GPU Limitation:** The Strix Halo's gfx1102 architecture isn't supported by PyTorch ROCm 6.2 wheels yet. Use CPU-only for now.
+
 ```bash
 nix-shell shell.nix
 # Then inside the shell:
-uv pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
-```
-
-The shell.nix provides:
-- ROCm 6.4 libraries (hipBLAS, rocBLAS, rocFFT, etc.)
-- Proper LD_LIBRARY_PATH for dynamic linking
-- HSA_OVERRIDE_GFX_VERSION=11.0.2 for AMD Strix Halo (RDNA 3.5)
-- Standard C++ libraries needed by PyTorch wheels
-
-For CPU only (not recommended on this platform):
-```bash
+rm -rf .venv
+uv venv --python python3.12
+uv sync --all-extras
 uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
-**GPU Verification:**
+**Verification:**
 ```bash
-uv run python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'ROCm available: {torch.cuda.is_available()}')"
+uv run python -c "import torch; print(f'PyTorch: {torch.__version__}')"
 ```
 
-Note: Current project runs on AMD Strix Halo platform. Use `device='cuda'` in PyTorch code (ROCm provides CUDA compatibility).
+The shell.nix provides Python 3.12 and all C++ libraries needed by PyTorch wheels. When GPU support becomes available, switch to:
+```bash
+uv pip install torch --index-url https://download.pytorch.org/whl/rocm6.2  # Future
+```
+
+See `README_ROCM.md` for detailed GPU status and building from source.
 
 ## Architecture
 
