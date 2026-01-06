@@ -125,7 +125,13 @@ scores, points = mass_score_triangle_torch(tensor, device='cuda')  # Future with
 
 ## Editing Code
 
-**CRITICAL:** Edit notebooks in `nbs/`, not Python files. Cells marked with `#| export` are exported to modules. After editing notebooks, run `nbdev_export` to regenerate Python files.
+**CRITICAL RULE: NEVER EDIT EXPORTED PYTHON FILES**
+
+- ✅ **DO:** Edit notebooks in `nbs/` - these are the source of truth
+- ❌ **DON'T:** Edit Python files in `asterisms_py/` - these are auto-generated
+- Cells marked with `#| export` are exported to Python modules
+- After editing notebooks, run `nbdev_export` to regenerate Python files
+- If you need to fix code, find it in the notebook and edit it there
 
 ## Dependencies
 
