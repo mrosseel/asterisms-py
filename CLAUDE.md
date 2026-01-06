@@ -100,12 +100,19 @@ See `README_ROCM.md` for detailed GPU status and building from source.
 
 ### GPU Acceleration
 
-Code supports GPU acceleration. Current deployment uses AMD Strix Halo with ROCm:
+**Current status: CPU-only** (AMD Strix Halo gfx1102 not supported by PyTorch ROCm 6.2 wheels)
+
+Use `device='cpu'` for all PyTorch operations:
 ```python
-scores, points = mass_score_triangle_torch(tensor, device='cuda')  # ROCm provides CUDA compatibility
+scores, points = mass_score_triangle_torch(tensor, device='cpu')
 ```
 
-Historical note: Code originally used `device='mps'` for Apple Silicon.
+When GPU support becomes available, ROCm provides CUDA API compatibility:
+```python
+scores, points = mass_score_triangle_torch(tensor, device='cuda')  # Future with ROCm
+```
+
+**Important:** Do not use `device='mps'` (Apple Metal) - this will fail on Linux/NixOS.
 
 ## Important Paths
 
