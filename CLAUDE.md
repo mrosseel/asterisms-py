@@ -40,17 +40,30 @@ uv run nbdev_export
 
 Uses uv for fast, reliable Python package management. Dependencies are specified in `pyproject.toml` using standard PEP 621 format.
 
-**PyTorch Installation (AMD Strix Halo/ROCm):**
-PyTorch is not included in standard dependencies due to platform-specific requirements. Install separately based on your hardware:
+**PyTorch Installation (AMD Strix Halo/ROCm on NixOS):**
+PyTorch is not included in standard dependencies due to platform-specific requirements.
 
-For AMD Strix Halo with ROCm 6.2:
+On NixOS, use the provided Nix shell for ROCm support:
 ```bash
+nix-shell shell.nix
+# Then inside the shell:
 uv pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
 ```
 
-For CPU only:
+The shell.nix provides:
+- ROCm 6.4 libraries (hipBLAS, rocBLAS, rocFFT, etc.)
+- Proper LD_LIBRARY_PATH for dynamic linking
+- HSA_OVERRIDE_GFX_VERSION=11.0.2 for AMD Strix Halo (RDNA 3.5)
+- Standard C++ libraries needed by PyTorch wheels
+
+For CPU only (not recommended on this platform):
 ```bash
 uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+**GPU Verification:**
+```bash
+uv run python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'ROCm available: {torch.cuda.is_available()}')"
 ```
 
 Note: Current project runs on AMD Strix Halo platform. Use `device='cuda'` in PyTorch code (ROCm provides CUDA compatibility).
