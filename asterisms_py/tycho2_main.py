@@ -135,12 +135,20 @@ def measure_squareness(tensor):
 def mass_score_triangle_torch(points_tensor, device='cpu'):
     points_tensor = points_tensor.to(device)  # Transfer tensor to GPU if available
     idx_combinations = torch.combinations(torch.arange(points_tensor.shape[0]), r=3)
+    print(f"There are {len(idx_combinations)} combinations")
                                           
     p1, p2, p3 = points_tensor[idx_combinations[:, 0]], points_tensor[idx_combinations[:, 1]], points_tensor[idx_combinations[:, 2]]
 
     a = torch.linalg.norm(p2 - p1, dim=1)
     b = torch.linalg.norm(p3 - p2, dim=1)
     c = torch.linalg.norm(p1 - p3, dim=1)
+
+    min_val = torch.min(torch.stack([a, b, c]), dim=0)[0]
+    max_val = torch.max(torch.stack([a, b, c]), dim=0)[0]
+    range_val = max_val - min_val
+    a = (a - min_val) / range_val
+    b = (b - min_val) / range_val
+    c = (c - min_val) / range_val
     
     mean = (a + b + c) / 3
     std_dev = torch.sqrt(((a - mean)**2 + (b - mean)**2 + (c - mean)**2) / 3)
@@ -206,7 +214,8 @@ def stars_for_point_and_radius(df, point, radius, max_mag):
     maxra = ra + radius
     mindec = dec
     maxdec = dec + radius
-    return df.filter((pl.col("RAmdeg") < maxra) & (pl.col("RAmdeg") > minra) & (pl.col("DEmdeg") < maxdec) & (pl.col("DEmdeg") > mindec) & (pl.col("Vmag") <= max_mag))
+    result = df.filter((pl.col("RAmdeg") < maxra) & (pl.col("RAmdeg") > minra) & (pl.col("DEmdeg") < maxdec) & (pl.col("DEmdeg") > mindec) & (pl.col("Vmag") <= max_mag))
+    return result
 
 def stars_for_center_and_radius(df, center, radius, max_mag):
     ra, dec = center
