@@ -1,6 +1,18 @@
 # ROCm Setup for AMD Strix Halo on NixOS
 
-## Quick Start
+## ⚠️ Current Limitation
+
+**GPU Architecture:** gfx1102 (Radeon 8060S Graphics / AMD Strix Halo)
+**PyTorch Support:** PyTorch ROCm 6.2 wheels don't include gfx1102 kernels yet.
+
+ROCm detects the GPU correctly (`torch.cuda.is_available() == True`), but GPU computation fails with "invalid device function" because pre-compiled kernels aren't available for this architecture.
+
+**Options:**
+1. **CPU-only PyTorch** (works now, slow for large datasets)
+2. **Wait for PyTorch 2.6+** with gfx1102 support
+3. **Build PyTorch from source** with gfx1102 target (advanced, time-consuming)
+
+## Quick Start (CPU Only)
 
 1. **Enter the development shell:**
 ```bash
@@ -14,14 +26,18 @@ uv venv --python python3.12
 uv sync --all-extras
 ```
 
-3. **Install PyTorch with ROCm:**
+3. **Install PyTorch (CPU-only for now):**
 ```bash
-uv pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
+# CPU version (works reliably)
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# OR ROCm version (GPU detected but kernels fail on gfx1102)
+# uv pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
 ```
 
-4. **Verify GPU support:**
+4. **Verify installation:**
 ```bash
-uv run python -c "import torch; print(f'ROCm available: {torch.cuda.is_available()}'); print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"}')"
+uv run python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'Device: cuda' if torch.cuda.is_available() else 'cpu')"
 ```
 
 5. **Run notebooks:**
