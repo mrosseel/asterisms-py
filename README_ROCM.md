@@ -2,15 +2,15 @@
 
 ## ⚠️ Current Limitation
 
-**GPU Architecture:** gfx1102 (Radeon 8060S Graphics / AMD Strix Halo)
-**PyTorch Support:** PyTorch ROCm 6.2 wheels don't include gfx1102 kernels yet.
+**GPU Architecture:** gfx1151 (AMD Strix Halo - Radeon 8060S Graphics)
+**PyTorch Support:** PyTorch ROCm 6.2 wheels don't include gfx1151 kernels yet.
 
 ROCm detects the GPU correctly (`torch.cuda.is_available() == True`), but GPU computation fails with "invalid device function" because pre-compiled kernels aren't available for this architecture.
 
 **Options:**
 1. **CPU-only PyTorch** (works now, slow for large datasets)
-2. **Wait for PyTorch 2.6+** with gfx1102 support
-3. **Build PyTorch from source** with gfx1102 target (advanced, time-consuming)
+2. **Wait for PyTorch 2.6+** with gfx1151 support
+3. **Build PyTorch from source** with gfx1151 target (advanced, time-consuming)
 
 ## Quick Start (CPU Only)
 
@@ -76,7 +76,7 @@ Make sure you're running from inside `nix-shell shell.nix`. The shell provides a
 
 ### PyTorch sees wrong architecture
 
-The AMD Strix Halo uses gfx1103 (RDNA 3.5), but PyTorch ROCm wheels target gfx1100. The `HSA_OVERRIDE_GFX_VERSION=11.0.2` environment variable tells ROCm to use gfx1100 compatibility mode.
+The AMD Strix Halo uses gfx1151 (RDNA 3.5), but PyTorch ROCm wheels don't include kernels for gfx1151. The `HSA_OVERRIDE_GFX_VERSION` environment variable can tell ROCm to use a compatible architecture, but gfx1151 is too new and not close enough to existing targets.
 
 ## System-Wide ROCm (Optional)
 

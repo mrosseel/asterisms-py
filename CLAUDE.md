@@ -42,7 +42,7 @@ Uses uv for fast, reliable Python package management. Dependencies are specified
 
 **PyTorch Installation (AMD Strix Halo on NixOS):**
 
-⚠️ **GPU Limitation:** The Strix Halo's gfx1102 architecture isn't supported by PyTorch ROCm 6.2 wheels yet. Use CPU-only for now.
+⚠️ **GPU Limitation:** The Strix Halo's gfx1151 architecture isn't supported by PyTorch ROCm 6.2 wheels yet. Use CPU-only for now.
 
 ```bash
 nix-shell shell.nix
@@ -100,7 +100,7 @@ See `README_ROCM.md` for detailed GPU status and building from source.
 
 ### GPU Acceleration
 
-**Current status: CPU-only** (AMD Strix Halo gfx1102 not supported by PyTorch ROCm 6.2 wheels)
+**Current status: CPU-only** (AMD Strix Halo gfx1151 not supported by PyTorch ROCm 6.2 wheels)
 
 Use `device='cpu'` for all PyTorch operations:
 ```python

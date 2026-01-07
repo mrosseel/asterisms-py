@@ -256,7 +256,3 @@ resultdf = pl.DataFrame({
     "region": pl.Int64,
     "item": []
 })
-
-
-    
-

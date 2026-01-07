@@ -32,7 +32,7 @@ pkgs.mkShell {
   shellHook = ''
     # Add ROCm to PATH
     export PATH="${pkgs.rocmPackages.clr}/bin:$PATH"
-    export HSA_OVERRIDE_GFX_VERSION=11.0.0  # AMD Strix Halo (gfx1103 -> gfx1100)
+    export HSA_OVERRIDE_GFX_VERSION=11.5.1  # AMD Strix Halo (gfx1151)
 
     # Library paths for dynamic linking
     export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [
@@ -49,9 +49,9 @@ pkgs.mkShell {
 
     echo "🚀 asterisms-py environment for AMD Strix Halo"
     echo "Python: $(python --version)"
-    echo "GPU: gfx1102 (Radeon 8060S) - ROCm available but PyTorch kernels missing"
+    echo "GPU: gfx1151 (AMD Strix Halo - Radeon 8060S) - ROCm available but PyTorch kernels missing"
     echo ""
-    echo "⚠️  PyTorch GPU support unavailable (gfx1102 not in ROCm 6.2 wheels)"
+    echo "⚠️  PyTorch GPU support unavailable (gfx1151 not in ROCm 6.2 wheels)"
     echo ""
     echo "Install PyTorch CPU-only:"
     echo "  uv pip install torch --index-url https://download.pytorch.org/whl/cpu"
