@@ -70,6 +70,51 @@ Ensure your user is in the `video` and `render` groups (should be configured in 
 
 Make sure you're running from inside `nix-shell shell.nix`. The shell provides all necessary libraries.
 
+### GPU VRAM Management (CRITICAL for Performance)
+
+The AMD Strix Halo APU allocates VRAM dynamically. Default is only **512MB**, which severely limits GPU utilization.
+
+**Check current VRAM:**
+```bash
+gpu-vram-info
+```
+
+**Increase VRAM allocation** (requires GPU restart - will kill Jupyter):
+```bash
+# Quick presets
+gpu-vram-presets  # Interactive menu
+
+# Or direct allocation
+gpu-vram-set 8192   # 8GB - good for medium workloads
+gpu-vram-set 16384  # 16GB - recommended for full catalog processing
+gpu-vram-set 65536  # 64GB - maximum for large-scale parallel processing
+```
+
+**VRAM Requirements for Asterism Processing:**
+- Star catalog: ~28 MB (loaded once to GPU)
+- Per region (worst case): ~3.5 GB
+- **Recommended:** 16GB minimum, 64GB for optimal performance
+- With 96GB VRAM: Can process ~28 regions in parallel
+
+### GPU Optimization Features
+
+The asterism processing code includes GPU-specific optimizations:
+
+1. **Catalog Preloading**: Entire star catalog loaded to VRAM once (~28MB)
+2. **GPU Filtering**: Star filtering done on GPU using boolean masks (much faster than CPU)
+3. **Persistent GPU Tensors**: Intermediate results kept on GPU between operations
+4. **Minimal CPU-GPU Transfers**: Only final results transferred back to CPU
+
+**Enable GPU optimization in notebooks:**
+```python
+# Automatically uses GPU if available
+process_regions(grid_points, start=0, use_gpu=True)
+```
+
+**Expected performance improvement:**
+- Without optimization: 6% GPU utilization, 90%+ VRAM full (512MB)
+- With optimization: 60-90% GPU utilization, improved throughput
+
 ### Performance Notes
 
 The AMD Strix Halo (gfx1151) has unique characteristics as an APU:
@@ -81,6 +126,7 @@ The AMD Strix Halo (gfx1151) has unique characteristics as an APU:
 - Matrix multiplication (2000×2000): CPU ~2436 GFLOPS, GPU ~2371 GFLOPS
 - GPU advantage increases with highly parallel operations (e.g., many triangles)
 - Best for workloads with thousands of concurrent operations
+- **Real workload**: Processing 2.4M stars, 2912 regions, ~4M triangles per region average
 
 ## System-Wide ROCm (Optional)
 
