@@ -57,6 +57,7 @@ pkgs.mkShell {
     echo "  uv pip install torch --index-url https://download.pytorch.org/whl/cpu"
     echo ""
     echo "To run notebooks:"
-    echo "  uv run jupyter notebook"
+    echo "  uv run jupyter notebook --ip=0.0.0.0"
+    echo "  or: ./runnotebook.sh"
   '';
 }

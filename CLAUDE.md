@@ -22,8 +22,8 @@ uv sync --all-extras
 **Run notebooks:**
 ```bash
 ./runnotebook.sh
-# or manually:
-uv run jupyter notebook
+# or manually (accessible from network):
+uv run jupyter notebook --ip=0.0.0.0
 ```
 
 **Export notebooks to Python modules:**
