@@ -1,18 +1,12 @@
 # ROCm Setup for AMD Strix Halo on NixOS
 
-## ⚠️ Current Limitation
+## ✅ GPU Support Working!
 
 **GPU Architecture:** gfx1151 (AMD Strix Halo - Radeon 8060S Graphics)
-**PyTorch Support:** PyTorch ROCm 6.2 wheels don't include gfx1151 kernels yet.
+**PyTorch Support:** ✅ AMD provides gfx1151-specific wheels with ROCm 7.10.0
+**Status:** Fully functional GPU acceleration
 
-ROCm detects the GPU correctly (`torch.cuda.is_available() == True`), but GPU computation fails with "invalid device function" because pre-compiled kernels aren't available for this architecture.
-
-**Options:**
-1. **CPU-only PyTorch** (works now, slow for large datasets)
-2. **Wait for PyTorch 2.6+** with gfx1151 support
-3. **Build PyTorch from source** with gfx1151 target (advanced, time-consuming)
-
-## Quick Start (CPU Only)
+## Quick Start (GPU Enabled)
 
 1. **Enter the development shell:**
 ```bash
@@ -21,7 +15,7 @@ nix-shell shell.nix
 
 2. **Create Python 3.12 venv and install dependencies:**
 ```bash
-rm -rf .venv  # Remove old Python 3.13 venv if exists
+rm -rf .venv  # Remove old venv if needed
 uv venv --python python3.12
 uv sync --all-extras
 ```
@@ -48,9 +42,11 @@ uv run jupyter notebook
 ## What the shell.nix Provides
 
 - **ROCm 6.4 libraries**: hipBLAS, rocBLAS, rocFFT, hipFFT, rocRAND, RCCL
-- **GFX version override**: Set to 11.0.2 for AMD Strix Halo (RDNA 3.5)
+- **APU optimization**: HSA_ENABLE_SDMA=0 to prevent artifacts
 - **Library paths**: Properly configured LD_LIBRARY_PATH for PyTorch wheels
 - **Standard libraries**: C++ stdlib and other dependencies for binary wheels
+
+**Note:** HSA_OVERRIDE_GFX_VERSION is no longer needed - modern PyTorch wheels have native gfx1151 support!
 
 ## Troubleshooting
 
@@ -74,9 +70,17 @@ Ensure your user is in the `video` and `render` groups (should be configured in 
 
 Make sure you're running from inside `nix-shell shell.nix`. The shell provides all necessary libraries.
 
-### PyTorch sees wrong architecture
+### Performance Notes
 
-The AMD Strix Halo uses gfx1151 (RDNA 3.5), but PyTorch ROCm wheels don't include kernels for gfx1151. The `HSA_OVERRIDE_GFX_VERSION` environment variable can tell ROCm to use a compatible architecture, but gfx1151 is too new and not close enough to existing targets.
+The AMD Strix Halo (gfx1151) has unique characteristics as an APU:
+- **Integrated GPU**: Shares memory with CPU, reducing transfer overhead
+- **40 RDNA 3.5 compute units**: Good for parallel workloads
+- **16-core CPU**: Very powerful, competitive with GPU for some tasks
+
+**Benchmark Results:**
+- Matrix multiplication (2000×2000): CPU ~2436 GFLOPS, GPU ~2371 GFLOPS
+- GPU advantage increases with highly parallel operations (e.g., many triangles)
+- Best for workloads with thousands of concurrent operations
 
 ## System-Wide ROCm (Optional)
 

@@ -42,28 +42,26 @@ Uses uv for fast, reliable Python package management. Dependencies are specified
 
 **PyTorch Installation (AMD Strix Halo on NixOS):**
 
-⚠️ **GPU Limitation:** The Strix Halo's gfx1151 architecture isn't supported by PyTorch ROCm 6.2 wheels yet. Use CPU-only for now.
+✅ **GPU Support Available!** AMD provides gfx1151-specific PyTorch wheels with ROCm 7.10.0.
 
 ```bash
 nix-shell shell.nix
 # Then inside the shell:
-rm -rf .venv
-uv venv --python python3.12
-uv sync --all-extras
-uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install --index-url https://repo.amd.com/rocm/whl/gfx1151/ torch torchvision torchaudio
 ```
 
 **Verification:**
 ```bash
-uv run python -c "import torch; print(f'PyTorch: {torch.__version__}')"
+uv run python test_gpu.py
+# Expected: ROCm available: True, Device: Radeon 8060S Graphics
 ```
 
-The shell.nix provides Python 3.12 and all C++ libraries needed by PyTorch wheels. When GPU support becomes available, switch to:
-```bash
-uv pip install torch --index-url https://download.pytorch.org/whl/rocm6.2  # Future
-```
+**Benchmark Results (AMD Strix Halo gfx1151):**
+- CPU (16-core): 2436 GFLOPS (2000×2000 matmul)
+- GPU (40 CU): 2371 GFLOPS
+- Note: For this APU, performance varies by workload. GPU excels at highly parallel operations.
 
-See `README_ROCM.md` for detailed GPU status and building from source.
+See `README_ROCM.md` for detailed setup and troubleshooting.
 
 ## Architecture
 
@@ -100,17 +98,20 @@ See `README_ROCM.md` for detailed GPU status and building from source.
 
 ### GPU Acceleration
 
-**Current status: CPU-only** (AMD Strix Halo gfx1151 not supported by PyTorch ROCm 6.2 wheels)
+**Status: ✅ Working** (AMD Strix Halo gfx1151 with ROCm 7.10.0)
 
-Use `device='cpu'` for all PyTorch operations:
+Automatically use GPU when available:
 ```python
-scores, points = mass_score_triangle_torch(tensor, device='cpu')
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+scores, points = mass_score_triangle_torch(tensor, device=device)
 ```
 
-When GPU support becomes available, ROCm provides CUDA API compatibility:
+Or explicitly:
 ```python
-scores, points = mass_score_triangle_torch(tensor, device='cuda')  # Future with ROCm
+scores, points = mass_score_triangle_torch(tensor, device='cuda')  # Use GPU
 ```
+
+**ROCm provides CUDA API compatibility** - use `device='cuda'` for AMD GPUs.
 
 **Important:** Do not use `device='mps'` (Apple Metal) - this will fail on Linux/NixOS.
 
