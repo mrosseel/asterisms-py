@@ -10,6 +10,11 @@ pkgs.mkShell {
 
     # ROCm packages for AMD GPU support
     rocmPackages.clr
+    rocmPackages.hipcc          # HIP compiler for custom kernels
+    rocmPackages.rocm-cmake     # CMake support for ROCm
+    rocmPackages.rocm-device-libs  # Device libraries for compilation
+    rocmPackages.rocprim        # ROCm primitives (required by rocThrust)
+    rocmPackages.rocthrust      # Thrust library for HIP (required by PyTorch headers)
     rocmPackages.hipblas
     rocmPackages.hipfft
     rocmPackages.hipsolver
@@ -30,8 +35,16 @@ pkgs.mkShell {
   ];
 
   shellHook = ''
-    # Add ROCm to PATH
-    export PATH="${pkgs.rocmPackages.clr}/bin:$PATH"
+    # Add ROCm tools to PATH
+    export PATH="${pkgs.rocmPackages.clr}/bin:${pkgs.rocmPackages.hipcc}/bin:$PATH"
+
+    # Set ROCM_PATH for build scripts
+    export ROCM_PATH="${pkgs.rocmPackages.clr}"
+    export HIP_PATH="${pkgs.rocmPackages.clr}"
+    export ROCPRIM_PATH="${pkgs.rocmPackages.rocprim}"
+    export ROCTHRUST_PATH="${pkgs.rocmPackages.rocthrust}"
+    export HIPSPARSE_PATH="${pkgs.rocmPackages.hipsparse}"
+    export HIPBLAS_PATH="${pkgs.rocmPackages.hipblas}"
 
     # APU-specific setting to prevent artifacts
     export HSA_ENABLE_SDMA=0
@@ -50,19 +63,21 @@ pkgs.mkShell {
       pkgs.rocmPackages.hipblas
       pkgs.rocmPackages.rocfft
       pkgs.rocmPackages.hipfft
+      pkgs.rocmPackages.rocm-device-libs
     ]}:$LD_LIBRARY_PATH"
 
     echo "🚀 asterisms-py environment for AMD Strix Halo"
     echo "Python: $(python --version)"
-    echo "GPU: gfx1151 (AMD Strix Halo - Radeon 8060S) - ROCm available but PyTorch kernels missing"
+    echo "GPU: gfx1151 (AMD Strix Halo - Radeon 8060S)"
+    echo "ROCm: $(hipcc --version | head -1 || echo 'hipcc not found')"
     echo ""
     echo "💡 PyTorch GPU support available for gfx1151!"
     echo ""
     echo "Install PyTorch with ROCm support:"
     echo "  uv pip install --index-url https://repo.amd.com/rocm/whl/gfx1151/ torch torchvision torchaudio"
     echo ""
-    echo "Or CPU-only:"
-    echo "  uv pip install torch --index-url https://download.pytorch.org/whl/cpu"
+    echo "🔥 HIP kernel compilation enabled"
+    echo "  Build custom kernel: cd hip_triangle && ./build.sh"
     echo ""
     echo "To run notebooks:"
     echo "  uv run jupyter notebook --ip=0.0.0.0"
