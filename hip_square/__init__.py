@@ -27,13 +27,16 @@ except (ImportError, OSError) as e:
     print(f"  hip_square load error: {e}")
 
 
-def score_squares_hip(stars_tensor, mode='3d'):
+def score_squares_hip(stars_tensor, mode='3d', max_dist=float('inf'), search_radius_deg=None):
     """
     Score all 4-star combinations for squareness using HIP kernel.
 
     Args:
         stars_tensor: [n_stars, 3] float32 tensor on GPU (RA, Dec, Mag)
         mode: '3d' for perceptual distance scoring, '2d' for angular-only
+        max_dist: max pairwise distance threshold (in scoring coordinate space).
+                  Quads with any pair exceeding this are skipped.
+        search_radius_deg: scale depth axis to match angular extent (for 3d mode)
 
     Returns:
         scores: [n_quads] float32 tensor of squareness scores
@@ -45,8 +48,8 @@ def score_squares_hip(stars_tensor, mode='3d'):
     if not stars_tensor.is_cuda:
         raise ValueError("stars_tensor must be on GPU")
 
-    scoring_data = radecmag_to_cartesian(stars_tensor) if mode == '3d' else radecmag_to_angular(stars_tensor)
-    scores, indices = square_hip.square_score(scoring_data)
+    scoring_data = radecmag_to_cartesian(stars_tensor, search_radius_deg=search_radius_deg) if mode == '3d' else radecmag_to_angular(stars_tensor)
+    scores, indices = square_hip.square_score(scoring_data, max_dist)
 
     indices_long = indices.long()
     p1 = stars_tensor[indices_long[:, 0]]

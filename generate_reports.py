@@ -1,7 +1,10 @@
 """Generate PDF reports and PiFinder observing lists from parquet results."""
-import os
 import json
+import math
+import os
+import sys
 import datetime
+import traceback
 import numpy as np
 import polars as pl
 import torch
@@ -19,6 +22,10 @@ from skyfield.projections import build_stereographic_projection
 
 from asterisms_py.core import (
     stars_for_center_and_radius, triangle_extent_deg, chain_extent_deg,
+    dedup_results,
+    DEFAULT_INSTRUMENT, instrument_search_configs,
+    eyepiece_to_search_config, camera_to_search_config,
+    InstrumentConfig, Eyepiece, Camera,
 )
 
 # --- Seasonal constants for 51 deg N ---
@@ -54,7 +61,7 @@ constellation_at = load_constellation_map()
 con_full_names = dict(load_constellation_names())
 con_full_names['CVn'] = 'Canes Venatici'
 
-dftycho = pl.read_parquet('support/tyc2.parquet')
+dftycho = pl.read_parquet('support/gaia-12.parquet')
 print(f"Catalog: {len(dftycho):,} stars ({list(dftycho.columns)})")
 
 
@@ -105,6 +112,73 @@ def _get_center(value):
     return position_of_radec(ra._hours, mean[1])
 
 
+def compute_solitary_score(focus_stars, center_ra, center_dec, extent_deg, max_mag, geom_score,
+                           catalog=None):
+    """Compute solitary score: geometric score weighted by flux dominance.
+
+    solitary = geom_score / flux_ratio, where flux_ratio is the fraction of
+    total field light contributed by the asterism stars. Lower = better
+    (good geometry + dominant in field).
+
+    If catalog is provided, use it instead of the global dftycho (for pre-filtered subsets).
+    """
+    cat = catalog if catalog is not None else dftycho
+    radius = max(extent_deg * 1.5, 0.05)
+    cos_dec = max(0.1, np.cos(np.radians(center_dec)))
+    query_radius = radius / cos_dec
+    field = stars_for_center_and_radius(cat, (center_ra, center_dec), query_radius, max_mag)
+
+    asterism_mags = np.array([s[2] for s in focus_stars])
+    asterism_flux = np.sum(10 ** (-0.4 * asterism_mags))
+
+    if len(field) == 0:
+        return geom_score  # no field stars, flux_ratio = 1
+
+    field_mags = field['Vmag'].to_numpy()
+    total_flux = np.sum(10 ** (-0.4 * field_mags))
+
+    flux_ratio = asterism_flux / total_flux if total_flux > 0 else 1.0
+    flux_ratio = max(flux_ratio, 1e-6)  # avoid division by zero
+    return geom_score / flux_ratio
+
+
+def _prefilter_catalog_for_solitary(candidates, max_mag):
+    """Pre-filter the global catalog to a bounding box covering all solitary candidates."""
+    all_ras = []
+    all_decs = []
+    max_extent = 0.0
+    for row in candidates.iter_rows(named=True):
+        pts = torch.tensor(row['stars'])
+        ra_mean = pts[:, 0].mean().item()
+        dec_mean = pts[:, 1].mean().item()
+        extent = chain_extent_deg(pts) if len(row['stars']) > 3 else triangle_extent_deg(pts)
+        all_ras.append(ra_mean)
+        all_decs.append(dec_mean)
+        max_extent = max(max_extent, extent)
+    margin = max(max_extent * 2.0, 1.0)
+    ra_min = min(all_ras) - margin
+    ra_max = max(all_ras) + margin
+    dec_min = min(all_decs) - margin
+    dec_max = max(all_decs) + margin
+    filtered = dftycho.filter(
+        (pl.col("Vmag") <= max_mag) &
+        (pl.col("DEmdeg") >= dec_min) & (pl.col("DEmdeg") <= dec_max)
+    )
+    if ra_min >= 0 and ra_max <= 360:
+        filtered = filtered.filter(
+            (pl.col("RAmdeg") >= ra_min) & (pl.col("RAmdeg") <= ra_max)
+        )
+    elif ra_min < 0:
+        filtered = filtered.filter(
+            (pl.col("RAmdeg") >= (ra_min % 360)) | (pl.col("RAmdeg") <= ra_max)
+        )
+    elif ra_max > 360:
+        filtered = filtered.filter(
+            (pl.col("RAmdeg") >= ra_min) | (pl.col("RAmdeg") <= (ra_max % 360))
+        )
+    return filtered
+
+
 def compute_isolation(focus_stars, center_coord, extent_deg, max_mag):
     """Count field stars within 1.5x extent that are brighter than the faintest asterism star."""
     faintest = max(s[2] for s in focus_stars)
@@ -153,11 +227,17 @@ def enrich_results(head, max_mag=15.0):
     return head
 
 
+_bv_cache = {}
+
 def _lookup_bv_for_focus_stars(focus_stars):
     """Look up B-V for focus stars (from result parquet, only RA/Dec/Vmag) by catalog match."""
     colors = []
     for s in focus_stars:
         ra, dec = s[0], s[1]
+        key = (round(ra, 3), round(dec, 3))
+        if key in _bv_cache:
+            colors.append(_bv_cache[key])
+            continue
         tol = 0.005
         match = dftycho.filter(
             ((pl.col("RAmdeg") - ra).abs() < tol) &
@@ -167,11 +247,13 @@ def _lookup_bv_for_focus_stars(focus_stars):
             row = match.row(0, named=True)
             bt, vt = row["BTmag"], row["VTmag"]
             if bt is not None and vt is not None:
-                colors.append(bv_to_rgb(bt - vt))
+                color = bv_to_rgb(bt - vt)
             else:
-                colors.append((1.0, 1.0, 1.0))
+                color = (1.0, 1.0, 1.0)
         else:
-            colors.append((1.0, 1.0, 1.0))
+            color = (1.0, 1.0, 1.0)
+        _bv_cache[key] = color
+        colors.append(color)
     return colors
 
 
@@ -202,7 +284,7 @@ def draw_points(ax, t, earth, projection, region_df, limiting_magnitude):
     })
     star_positions = earth.at(t).observe(Star.from_dataframe(fs))
     fs['x'], fs['y'] = projection(star_positions)
-    marker_size = (0.5 + limiting_magnitude - fs['magnitude']) ** 2.0
+    marker_size = np.maximum((0.5 + limiting_magnitude - fs['magnitude']) ** 2.0, 0.5)
     ax.scatter(fs['x'], fs['y'], s=marker_size, c=colors, edgecolors='none', zorder=5)
 
 
@@ -221,12 +303,12 @@ def draw_focus_stars(ax, t, earth, projection, focus_stars, limiting_magnitude):
     })
     star_positions = earth.at(t).observe(Star.from_dataframe(fs))
     fs['x'], fs['y'] = projection(star_positions)
-    marker_size = (0.5 + limiting_magnitude - fs['magnitude']) ** 2.0
-    ax.scatter(fs['x'], fs['y'], s=marker_size, c=colors, edgecolors='none', zorder=10)
+    marker_size = np.maximum((0.5 + limiting_magnitude - fs['magnitude']) ** 2.0, 6.0)
+    ax.scatter(fs['x'], fs['y'], s=marker_size, c='#ffdd00', edgecolors='none', zorder=10)
     return fs
 
 
-def _draw_shape_edges(ax, fs_focus, chart_mag, n_stars, shape='triangle', data_limit=1.0):
+def _draw_shape_edges(ax, fs_focus, limiting_magnitude, n_stars, shape='triangle', data_limit=1.0):
     """Draw polygon edges with gaps near each vertex so stars remain visible."""
     xs = list(fs_focus['x'])
     ys = list(fs_focus['y'])
@@ -247,6 +329,8 @@ def _draw_shape_edges(ax, fs_focus, chart_mag, n_stars, shape='triangle', data_l
     pts_per_data = 400.0 / (2.0 * data_limit)
     fixed_gap_data = 0.0002  # fixed gap beyond marker edge
 
+    size_lm = limiting_magnitude
+
     # Collinear chains: open path (no wrap-around); stars already sorted along the line
     n_edges = n_stars - 1 if shape == 'collinear' else n_stars
 
@@ -258,9 +342,9 @@ def _draw_shape_edges(ax, fs_focus, chart_mag, n_stars, shape='triangle', data_l
         length = np.hypot(dx, dy)
         if length < 1e-10:
             continue
-        # Marker radius in data coords + fixed gap
-        r0 = (0.5 + chart_mag - m0) / (2.0 * pts_per_data) + fixed_gap_data
-        r1 = (0.5 + chart_mag - m1) / (2.0 * pts_per_data) + fixed_gap_data
+        # Marker radius in data coords + fixed gap (floor at fixed_gap to handle faint stars)
+        r0 = max((0.5 + size_lm - m0) / (2.0 * pts_per_data), 0) + fixed_gap_data
+        r1 = max((0.5 + size_lm - m1) / (2.0 * pts_per_data), 0) + fixed_gap_data
         frac0 = min(r0 / length, 0.3)
         frac1 = min(r1 / length, 0.3)
         sx = x0 + dx * frac0
@@ -271,12 +355,14 @@ def _draw_shape_edges(ax, fs_focus, chart_mag, n_stars, shape='triangle', data_l
                 clip_on=True)
 
 
-def _shape_edge_vertices(stars, shape):
-    """Return ordered RA/Dec vertices forming the shape edges (closed or open polyline).
+def _shape_edge_segments(stars, shape, gap_deg=0.02):
+    """Return line segments with gaps near star vertices.
 
-    For triangles: closed polygon 0→1→2→0
+    Each segment is shortened by gap_deg (degrees) from both ends.
+
+    For triangles: closed 0->1, 1->2, 2->0
     For squares: closed polygon sorted by angle from centroid
-    For collinear: open path 0→1→...→N-1
+    For collinear: open 0->1, 1->2, ..., N-2->N-1
     """
     pts = [(s[0], s[1]) for s in stars]
     if shape == 'square' and len(pts) == 4:
@@ -285,16 +371,37 @@ def _shape_edge_vertices(stars, shape):
         angles = [np.arctan2(p[1] - cy, p[0] - cx) for p in pts]
         order = np.argsort(angles)
         pts = [pts[i] for i in order]
-    verts = [[round(ra, 6), round(dec, 6)] for ra, dec in pts]
+
+    n = len(pts)
+    edges = [(i, i + 1) for i in range(n - 1)]
     if shape in ('triangle', 'square'):
-        verts.append(verts[0])
-    return verts
+        edges.append((n - 1, 0))
+
+    segments = []
+    for i, j in edges:
+        ra0, dec0 = pts[i]
+        ra1, dec1 = pts[j]
+        cos_dec = np.cos(np.radians((dec0 + dec1) / 2))
+        dra = (ra1 - ra0) * cos_dec
+        ddec = dec1 - dec0
+        length = np.hypot(dra, ddec)
+        if length < 1e-10:
+            continue
+        frac = min(gap_deg / length, 0.3)
+        segments.append([
+            [round(ra0 + (ra1 - ra0) * frac, 6),
+             round(dec0 + (dec1 - dec0) * frac, 6)],
+            [round(ra1 - (ra1 - ra0) * frac, 6),
+             round(dec1 - (dec1 - dec0) * frac, 6)],
+        ])
+    return segments
 
 
-def generate_pifinder_list(enriched_results, outdir, name, shape='triangle'):
-    list_dir = os.path.join(outdir, 'lists')
-    os.makedirs(list_dir, exist_ok=True)
-    list_path = os.path.join(list_dir, f'{name}.pifinder')
+def generate_pifinder_list(enriched_results, outdir, name, shape='triangle', pifinder_outdir=None):
+    if not pifinder_outdir:
+        return
+    os.makedirs(pifinder_outdir, exist_ok=True)
+    pifinder_paths = [os.path.join(pifinder_outdir, f'{name}.pifinder')]
 
     objects = []
     for ast_idx, row in enumerate(enriched_results.iter_rows(named=True)):
@@ -305,12 +412,12 @@ def generate_pifinder_list(enriched_results, outdir, name, shape='triangle'):
         star_mags = [s[2] for s in row['stars']]
         star_pts = torch.tensor(row['stars'])
         extent = chain_extent_deg(star_pts) if len(row['stars']) > 3 else triangle_extent_deg(star_pts)
-        edge_verts = _shape_edge_vertices(row['stars'], shape)
+        edge_segments = _shape_edge_segments(row['stars'], shape)
         extent_arcsec = extent * 3600.0
 
         notes_parts = [f"score={score:.6f}"]
         if 'tilt' in row:
-            notes_parts.append(f"tilt={row['tilt']:.0f}°")
+            notes_parts.append(f"tilt={row['tilt']:.0f}\u00b0")
         notes_parts.append(f"mags={','.join(f'{m:.1f}' for m in star_mags)}")
 
         obj = {
@@ -323,7 +430,7 @@ def generate_pifinder_list(enriched_results, outdir, name, shape='triangle'):
                 "filter_mag": round(min(star_mags), 2),
             },
             "const": row['CON'],
-            "extents": {"shape": edge_verts},
+            "extents": {"geometry": "segments", "shape": edge_segments},
             "notes": ", ".join(notes_parts),
         }
         objects.append(obj)
@@ -336,13 +443,14 @@ def generate_pifinder_list(enriched_results, outdir, name, shape='triangle'):
         "objects": objects,
     }
 
-    with open(list_path, 'w') as f:
-        json.dump(pifinder_data, f, indent=2)
+    for path in pifinder_paths:
+        with open(path, 'w') as f:
+            json.dump(pifinder_data, f, indent=2)
 
-    print(f"  Wrote {len(objects)} entries to {list_path}")
+    print(f"  Wrote {len(objects)} entries to {len(pifinder_paths)} location(s)")
 
 
-def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_override=None, shape='triangle'):
+def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_override=None, shape='triangle', instrument_info=None, scoring=''):
     fov_suffix = f'_fov{fov_override:.1f}deg' if fov_override else ''
     pdf_path = os.path.join(outdir, f'{name}{fov_suffix}.pdf')
     limiting_magnitude = max_mag
@@ -361,10 +469,19 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
         ax.text(0.5, 0.87, f'{title}{title_extra}',
                 fontsize=12, ha='center', va='top', transform=ax.transAxes, color='#cccccc')
 
+        # Instrument info subtitle
+        if instrument_info:
+            ax.text(0.5, 0.83, instrument_info,
+                    fontsize=9, ha='center', va='top', transform=ax.transAxes, color='#999999',
+                    fontfamily='monospace')
+
         has_isolation = 'isolation' in enriched_results.columns
         has_tilt = 'tilt' in enriched_results.columns
+        has_solitary = 'solitary_score' in enriched_results.columns
         table_data = []
         col_labels = ['Rank', 'Score', 'Constellation', 'RA', 'Dec']
+        if has_solitary:
+            col_labels.append('Solitary')
         if has_tilt:
             col_labels.append('Tilt')
         if has_isolation:
@@ -374,17 +491,21 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
                 str(idx + 1), f"{row['score']:.6f}", row['CONSTELLATION'],
                 row['Rah_full'], row['Dec_full'],
             ]
+            if has_solitary:
+                row_data.append(f"{row['solitary_score']:.4f}")
             if has_tilt:
-                row_data.append(f"{row['tilt']:.0f}°")
+                row_data.append(f"{row['tilt']:.0f}\u00b0")
             if has_isolation:
                 row_data.append(str(row['isolation']))
             table_data.append(row_data)
 
-        col_widths = [0.06, 0.12, 0.18, 0.22, 0.22]
+        col_widths = [0.06, 0.12, 0.18, 0.20, 0.20]
+        if has_solitary:
+            col_widths.append(0.10)
         if has_tilt:
             col_widths.append(0.08)
         if has_isolation:
-            col_widths.append(0.10)
+            col_widths.append(0.08)
         table = ax.table(cellText=table_data,
                          colLabels=col_labels,
                          loc='center', cellLoc='center',
@@ -408,6 +529,7 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
         plt.close(fig)
 
         # --- Per-asterism pages ---
+        n_failures = 0
         for idx, entry in enumerate(enriched_results.iter_rows(named=True)):
             try:
                 focus_stars = entry['stars']
@@ -445,11 +567,12 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
                 angle = np.pi - field_of_view_degrees / 360.0 * np.pi
                 limit = np.sin(angle) / (1.0 - np.cos(angle))
 
-                draw_points(ax_chart, t, earth, projection, region_stars, chart_mag)
-                fs_focus = draw_focus_stars(ax_chart, t, earth, projection, focus_stars, chart_mag)
+                draw_points(ax_chart, t, earth, projection, region_stars, limiting_magnitude)
+                fs_focus = draw_focus_stars(ax_chart, t, earth, projection, focus_stars, limiting_magnitude)
 
                 # Shape edges with gaps near stars
-                _draw_shape_edges(ax_chart, fs_focus, chart_mag, n_stars=len(focus_stars), shape=shape, data_limit=limit)
+                _draw_shape_edges(ax_chart, fs_focus, limiting_magnitude, n_stars=len(focus_stars), shape=shape,
+                                  data_limit=limit)
                 ax_chart.set_xlim(-limit, limit)
                 ax_chart.set_ylim(-limit, limit)
                 ax_chart.xaxis.set_visible(False)
@@ -461,17 +584,30 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
                 for spine in ax_chart.spines.values():
                     spine.set_edgecolor('#333333')
 
-                # Magnitude scale legend
-                mag_steps = list(range(0, int(chart_mag) + 1, 2))
-                if mag_steps[-1] != int(chart_mag):
-                    mag_steps.append(int(chart_mag))
+                # Magnitude scale legend — bounded by actual stars in chart
+                focus_mags = [s[2] for s in focus_stars]
+                field_mags = region_stars["Vmag"].to_list() if len(region_stars) > 0 else []
+                all_mags = focus_mags + field_mags
+                legend_mag_min = int(np.floor(min(all_mags))) if all_mags else 0
+                legend_mag_max = int(np.ceil(max(all_mags))) if all_mags else int(limiting_magnitude)
+                mag_steps = list(range(legend_mag_min, legend_mag_max + 1, 2))
+                if not mag_steps or mag_steps[-1] != legend_mag_max:
+                    mag_steps.append(legend_mag_max)
                 for m in mag_steps:
-                    s = (0.5 + chart_mag - m) ** 2.0
-                    ax_chart.scatter([], [], s=s, c='white', label=f'mag {m}')
-                legend = ax_chart.legend(loc='upper right', title='Magnitude', fontsize=8,
+                    s = max((0.5 + limiting_magnitude - m) ** 2.0, 0.5)
+                    ax_chart.scatter([], [], s=s, c='white', label=f'{m}')
+                legend = ax_chart.legend(loc='upper right', title='Mag', fontsize=8,
                                title_fontsize=9, framealpha=0.7, facecolor='#1a1a1a',
                                edgecolor='#333333', labelcolor='white')
                 legend.get_title().set_color('white')
+
+                # Extent and mag range annotation (bottom-left)
+                min_star_mag = min(s[2] for s in focus_stars)
+                max_star_mag = max(s[2] for s in focus_stars)
+                ann_text = f"{extent:.2f}°  mag {min_star_mag:.1f}\u2013{max_star_mag:.1f}"
+                ax_chart.text(0.03, 0.03, ann_text, transform=ax_chart.transAxes,
+                             fontsize=8, color='#aaaaaa', fontfamily='monospace',
+                             verticalalignment='bottom')
 
                 # --- Info panel (dark mode) ---
                 ax_info = fig.add_subplot(gs[1])
@@ -579,11 +715,19 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
                 tilt_line = ""
                 if 'tilt' in entry and shape in ('triangle', 'square'):
                     tilt_val = entry['tilt']
-                    tilt_line = f"Tilt: {tilt_val:.1f}°  (0° = face-on, 90° = edge-on)\n"
+                    tilt_line = f"Tilt: {tilt_val:.1f}\u00b0  (0\u00b0 = face-on, 90\u00b0 = edge-on)\n"
 
                 isolation_line = ""
                 if has_isolation:
                     isolation_line = f"Isolation: {entry['isolation']} nearby field stars\n"
+
+                solitary_line = ""
+                if has_solitary:
+                    solitary_line = f"Solitary: {entry['solitary_score']:.4f}  (score / flux dominance, lower = better)\n"
+
+                instrument_line = ""
+                if instrument_info:
+                    instrument_line = f"{instrument_info}\n"
 
                 # Star table: show for short chains, skip for long ones
                 MAX_TABLE_STARS = 8
@@ -627,6 +771,8 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
                     f"\n"
                     f"{tilt_line}"
                     f"{isolation_line}"
+                    f"{solitary_line}"
+                    f"{instrument_line}"
                     f"Chart: {field_of_view_degrees:.1f} deg FOV,  search limiting mag {limiting_magnitude:.0f}"
                     f"{extra_info}"
                 )
@@ -656,12 +802,14 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
 
                 pdf.savefig(fig, bbox_inches='tight', facecolor=fig.get_facecolor())
                 plt.close(fig)
-            except Exception as e:
+            except (ValueError, RuntimeError, KeyError) as e:
+                n_failures += 1
                 print(f"  Error on entry {idx}: {e}")
-                import traceback
                 traceback.print_exc()
                 plt.close('all')
 
+        if n_failures > 0:
+            print(f"  WARNING: {n_failures}/{len(enriched_results)} pages failed to render")
     print(f"  Wrote {pdf_path}")
 
 
@@ -688,147 +836,223 @@ def filter_seasonal(enriched, season):
 
 
 # --- Output directory structure ---
-# reports/<scope>/<shape>[/<scoring>]/
-REPORT_DIR = 'reports'
+# output/<run_name>/
+#   <shape>/<eyepiece>/          ← PDFs
+#   pifinder_lists/<shape>/<eyepiece>/  ← PiFinder files
+OUTPUT_DIR = 'output'
 
 # (subdir_path, scoring, parquet_file, max_mag, display_name, shape)
-MODES = [
+LEGACY_MODES = [
     # Telescopic
-    ("telescopic/triangles", "3d", "result_triangle2.parquet",        15.0, "Telescopic triangles 3D", "triangle"),
-    ("telescopic/triangles", "2d", "result_triangle2_2d.parquet",     15.0, "Telescopic triangles 2D", "triangle"),
-    ("telescopic/squares",   "3d", "result_squareness.parquet",       15.0, "Telescopic squares 3D", "square"),
-    ("telescopic/squares",   "2d", "result_squareness_2d.parquet",    15.0, "Telescopic squares 2D", "square"),
-    ("telescopic/collinear/smooth",     "smooth",     "result_collinear_smooth.parquet",     15.0, "Telescopic collinear (smooth)", "collinear"),
-    ("telescopic/collinear/smooth_mag", "smooth_mag", "result_collinear_smooth_mag.parquet", 15.0, "Telescopic collinear (smooth+mag)", "collinear"),
+    ("telescopic/triangles", "3d", "results/result_triangle2.parquet",        15.0, "Telescopic triangles 3D", "triangle"),
+    ("telescopic/triangles", "2d", "results/result_triangle2_2d.parquet",     15.0, "Telescopic triangles 2D", "triangle"),
+    ("telescopic/squares",   "3d", "results/result_squareness.parquet",       15.0, "Telescopic squares 3D", "square"),
+    ("telescopic/squares",   "2d", "results/result_squareness_2d.parquet",    15.0, "Telescopic squares 2D", "square"),
+    ("telescopic/collinear/smooth",     "smooth",     "results/result_collinear_smooth.parquet",     15.0, "Telescopic collinear (smooth)", "collinear"),
+    ("telescopic/collinear/smooth_mag", "smooth_mag", "results/result_collinear_smooth_mag.parquet", 15.0, "Telescopic collinear (smooth+mag)", "collinear"),
     # Binocular
-    ("binocular/triangles", "3d", "result_triangle2_bino.parquet",    11.0, "Binocular triangles 3D", "triangle"),
-    ("binocular/triangles", "2d", "result_triangle2_bino_2d.parquet", 11.0, "Binocular triangles 2D", "triangle"),
-    ("binocular/collinear/smooth",     "smooth",     "result_collinear_bino_smooth.parquet",     11.0, "Binocular collinear (smooth)", "collinear"),
-    ("binocular/collinear/smooth_mag", "smooth_mag", "result_collinear_bino_smooth_mag.parquet", 11.0, "Binocular collinear (smooth+mag)", "collinear"),
+    ("binocular/triangles", "3d", "results/result_triangle2_bino.parquet",    11.0, "Binocular triangles 3D", "triangle"),
+    ("binocular/triangles", "2d", "results/result_triangle2_bino_2d.parquet", 11.0, "Binocular triangles 2D", "triangle"),
+    ("binocular/collinear/smooth",     "smooth",     "results/result_collinear_bino_smooth.parquet",     11.0, "Binocular collinear (smooth)", "collinear"),
+    ("binocular/collinear/smooth_mag", "smooth_mag", "results/result_collinear_bino_smooth_mag.parquet", 11.0, "Binocular collinear (smooth+mag)", "collinear"),
     # Naked eye
-    ("naked_eye/triangles", "3d", "result_triangle2_naked.parquet",    6.0, "Naked eye triangles 3D", "triangle"),
-    ("naked_eye/triangles", "2d", "result_triangle2_naked_2d.parquet", 6.0, "Naked eye triangles 2D", "triangle"),
+    ("naked_eye/triangles", "3d", "results/result_triangle2_naked.parquet",    6.0, "Naked eye triangles 3D", "triangle"),
+    ("naked_eye/triangles", "2d", "results/result_triangle2_naked_2d.parquet", 6.0, "Naked eye triangles 2D", "triangle"),
 ]
 
-if __name__ == '__main__':
- for subdir_path, scoring, filename, max_mag, display_name, shape in MODES:
+
+def _build_instrument_modes(inst):
+    """Build MODES list from instrument config.
+
+    Directory structure: <shape>/<tag>/
+    Shapes: triangles (3d/2d), squares (3d/2d), collinear (smooth/smooth_mag)
+    Supports both eyepieces and camera configs.
+    """
+    modes = []
+
+    configs = []
+    for ep in inst.eyepieces:
+        cfg = eyepiece_to_search_config(inst, ep)
+        tag = f"{ep.focal_length_mm:.0f}mm"
+        configs.append((cfg, tag, ep))
+    if inst.camera:
+        cfg = camera_to_search_config(inst)
+        tag = inst.camera.name
+        configs.append((cfg, tag, None))
+
+    for cfg, tag, ep in configs:
+        config_tag = cfg.name
+
+        # Triangles
+        for scoring in ("3d", "2d"):
+            suffix = "" if scoring == "3d" else "_2d"
+            modes.append((
+                f"triangles/{tag}",
+                scoring,
+                f"results/result_triangle2_{config_tag}{suffix}.parquet",
+                cfg.max_mag,
+                f"{inst.name} {tag} triangles {scoring.upper()}",
+                "triangle",
+                cfg,
+                ep,
+            ))
+
+        # Squares
+        for scoring in ("3d", "2d"):
+            suffix = "" if scoring == "3d" else "_2d"
+            modes.append((
+                f"squares/{tag}",
+                scoring,
+                f"results/result_squareness_{config_tag}{suffix}.parquet",
+                cfg.max_mag,
+                f"{inst.name} {tag} squares {scoring.upper()}",
+                "square",
+                cfg,
+                ep,
+            ))
+
+        # Collinear
+        for col_scoring in ("smooth", "smooth_mag"):
+            modes.append((
+                f"collinear/{col_scoring}/{tag}",
+                col_scoring,
+                f"results/result_collinear_{config_tag}_{col_scoring}.parquet",
+                cfg.max_mag,
+                f"{inst.name} {tag} collinear ({col_scoring})",
+                "collinear",
+                cfg,
+                ep,
+            ))
+
+    return modes
+
+
+def _instrument_info_str(inst, ep, cfg):
+    """Build instrument info string for PDF display."""
+    scope_fl = inst.aperture_mm * inst.focal_ratio
+    if ep is not None:
+        magnification = scope_fl / ep.focal_length_mm
+        tfov = ep.afov_deg / magnification
+        return (
+            f"{inst.aperture_mm:.0f}mm f/{inst.focal_ratio:.0f}  |  "
+            f"{ep.focal_length_mm:.0f}mm ({ep.afov_deg:.0f}\u00b0 AFOV)  |  "
+            f"{magnification:.0f}x  |  TFOV {tfov:.2f}\u00b0  |  "
+            f"LM {cfg.max_mag}  |  SQM {inst.sqm}"
+        )
+    cam = inst.camera
+    sensor_w = cam.res_x * cam.pixel_size_um / 1000
+    sensor_h = cam.res_y * cam.pixel_size_um / 1000
+    fov_w = 2 * math.degrees(math.atan(sensor_w / (2 * scope_fl)))
+    fov_h = 2 * math.degrees(math.atan(sensor_h / (2 * scope_fl)))
+    return (
+        f"{inst.aperture_mm:.0f}mm f/{inst.focal_ratio:.0f}  |  "
+        f"{cam.name} ({cam.res_x}\u00d7{cam.res_y})  |  "
+        f"FOV {fov_w:.2f}\u00b0\u00d7{fov_h:.2f}\u00b0  |  "
+        f"LM {cfg.max_mag}  |  SQM {inst.sqm}"
+    )
+
+
+def _process_mode(subdir_path, scoring, filename, max_mag, display_name, shape,
+                   search_config=None, eyepiece=None, inst=None, run_dir=None):
+    """Process a single report mode (legacy or instrument-derived)."""
     if not os.path.exists(filename):
         print(f"Skipping {subdir_path}/{scoring}: {filename} not found")
-        continue
+        return
 
-    outdir = os.path.join(REPORT_DIR, subdir_path)
+    if run_dir is None:
+        run_dir = OUTPUT_DIR
+    outdir = os.path.join(run_dir, subdir_path)
     os.makedirs(outdir, exist_ok=True)
+    run_name = os.path.basename(run_dir)
+    pifinder_outdir = os.path.join(OUTPUT_DIR, "pifinder_lists", run_name, subdir_path)
 
     print(f"\n{'=' * 60}")
     print(f"Generating: {subdir_path}/{scoring} (limiting mag {max_mag})")
 
     df = pl.read_parquet(filename)
-    print(f"  {len(df)} results")
+    df = dedup_results(df)
+    print(f"  {len(df)} results (after dedup)")
 
-    # Filter 3D triangle/square results by tilt: keep 10-60° (meaningful depth, not edge-on)
+    # Build instrument info string if applicable
+    inst_info = None
+    if inst and search_config and (eyepiece is not None or inst.camera):
+        inst_info = _instrument_info_str(inst, eyepiece, search_config)
+
+    # Filter 3D triangle/square results by tilt: keep 10-60deg
     if scoring == '3d' and shape in ('triangle', 'square') and 'tilt' in df.columns:
         before = len(df)
         df = df.filter((pl.col("tilt") >= 10) & (pl.col("tilt") <= 60))
-        print(f"  Tilt filter (10°-60°): {before} → {len(df)} results")
+        print(f"  Tilt filter (10\u00b0-60\u00b0): {before} \u2192 {len(df)} results")
 
     if shape == 'collinear' and 'chain_len' in df.columns:
-        # Group chain lengths into bins of ~20 pages each
-        chain_lengths = sorted(df["chain_len"].unique().to_list())
-        MAX_PAGES = 20
+        # Filter chains with duplicate stars (near-zero spacings)
+        def _has_unique_stars(stars):
+            coords = [(round(s[0], 4), round(s[1], 4)) for s in stars]
+            return len(coords) == len(set(coords))
+        before = len(df)
+        df = df.filter(pl.col("stars").map_elements(_has_unique_stars, return_dtype=pl.Boolean))
+        if len(df) < before:
+            print(f"  Removed {before - len(df)} chains with duplicate stars")
+        _process_collinear_mode(df, outdir, pifinder_outdir, scoring, max_mag,
+                                display_name, shape, search_config, inst_info, run_dir)
+        return
 
-        # First pass: count visible results per chain length
-        visible_per_clen = {}
-        for clen in chain_lengths:
-            clen_df = df.filter(pl.col("chain_len") == clen).sort("score")
-            enriched = enrich_results(clen_df.head(100), max_mag=max_mag)
-            vis = filter_visible_51n(enriched)
-            if len(vis) > 0:
-                visible_per_clen[clen] = vis
-                print(f"  {clen}-star: {len(vis)} visible")
-            else:
-                print(f"  {clen}-star: 0 visible")
-
-        # Build bins greedily: accumulate chain lengths until ~MAX_PAGES visible
-        bins = []
-        cur_clens = []
-        cur_count = 0
-        for clen in sorted(visible_per_clen.keys()):
-            n_vis = len(visible_per_clen[clen])
-            # Single chain length already fills a bin? Give it its own.
-            if n_vis >= MAX_PAGES:
-                if cur_clens:
-                    bins.append(cur_clens)
-                bins.append([clen])
-                cur_clens = []
-                cur_count = 0
-            else:
-                cur_clens.append(clen)
-                cur_count += n_vis
-                if cur_count >= MAX_PAGES:
-                    bins.append(cur_clens)
-                    cur_clens = []
-                    cur_count = 0
-        if cur_clens:
-            bins.append(cur_clens)
-
-        # Generate one PDF per bin
-        for bin_clens in bins:
-            if len(bin_clens) == 1:
-                clen = bin_clens[0]
-                bin_name = f"{scoring}_{clen}star"
-                bin_display = f"{display_name} ({clen}-star)"
-            else:
-                bin_name = f"{scoring}_{bin_clens[0]}-{bin_clens[-1]}star"
-                bin_display = f"{display_name} ({bin_clens[0]}-{bin_clens[-1]}-star)"
-
-            # Combine visible results from all chain lengths in this bin
-            bin_visible = pl.concat([visible_per_clen[c] for c in bin_clens])
-            bin_visible = bin_visible.sort("score").head(MAX_PAGES)
-
-            print(f"\n  --- {bin_display}: {len(bin_visible)} pages ---")
-            generate_pdf(bin_visible, outdir, f"{bin_name}_51N",
-                         f"Top {len(bin_visible)} visible from 51\u00b0N - {bin_display}",
-                         max_mag=max_mag, shape=shape)
-            # Strip scoring prefix from pifinder list names — directory makes it clear
-            list_bin_name = bin_name.removeprefix(f"{scoring}_")
-            generate_pifinder_list(bin_visible, outdir, f"{list_bin_name}_51N", shape=shape)
-
-            for season in SEASONS:
-                seasonal = filter_seasonal(bin_visible, season).head(MAX_PAGES)
-                if len(seasonal) > 0:
-                    generate_pifinder_list(seasonal, outdir, f"{list_bin_name}_{season}_51N", shape=shape)
-
-        # Also generate an "all lengths" combined report (top 10 overall)
-        all_enriched = enrich_results(df.sort("score").head(100), max_mag=max_mag)
-        visible = filter_visible_51n(all_enriched)
-        if len(visible) > 0:
-            top10 = visible.head(10)
-            generate_pdf(top10, outdir, f"{scoring}_51N",
-                         f"Top 10 visible from 51\u00b0N - {display_name}", max_mag=max_mag, shape=shape)
-            generate_pifinder_list(top10, outdir, "top10_51N", shape=shape)
-        continue
-
-    # Non-collinear: existing logic
-    all_enriched = enrich_results(df.sort("score").head(100), max_mag=max_mag)
+    # Non-collinear: enrich top 500 once and reuse for both main report and solitary
+    sorted_df = df.sort("score")
+    all_enriched_500 = enrich_results(sorted_df.head(500), max_mag=max_mag)
+    all_enriched = all_enriched_500.head(100)
     visible = filter_visible_51n(all_enriched)
 
     if len(visible) == 0:
         print(f"  No asterisms visible from 51N for {subdir_path}/{scoring}")
-        continue
+        return
 
     top10 = visible.head(10)
     generate_pdf(top10, outdir, f"{scoring}_51N",
-                 f"Top 10 visible from 51\u00b0N - {display_name}", max_mag=max_mag, shape=shape)
-    generate_pifinder_list(top10, outdir, f"{scoring}_51N", shape=shape)
+                 f"Top 10 visible from 51\u00b0N - {display_name}", max_mag=max_mag,
+                 shape=shape, instrument_info=inst_info)
+    generate_pifinder_list(top10, outdir, f"{scoring}_51N", shape=shape, pifinder_outdir=pifinder_outdir)
     print(f"  51N: {len(top10)} asterisms")
 
     for season in SEASONS:
         seasonal = filter_seasonal(visible, season).head(10)
         if len(seasonal) > 0:
-            generate_pifinder_list(seasonal, outdir, f"{scoring}_{season}_51N", shape=shape)
+            generate_pifinder_list(seasonal, outdir, f"{scoring}_{season}_51N", shape=shape, pifinder_outdir=pifinder_outdir)
         else:
             print(f"  No {season} asterisms for {subdir_path}/{scoring}")
 
+    # Solitary scoring pass: score / flux_ratio over top 500 candidates
+    solitary_candidates = sorted_df.head(500)
+    solitary_catalog = _prefilter_catalog_for_solitary(solitary_candidates, max_mag)
+    print(f"  Solitary pre-filtered catalog: {len(solitary_catalog):,} stars (from {len(dftycho):,})")
+    solitary_scores = []
+    for row in solitary_candidates.iter_rows(named=True):
+        focus_stars = row['stars']
+        pts = torch.tensor(focus_stars)
+        center_ra = pts[:, 0].mean().item()
+        center_dec = pts[:, 1].mean().item()
+        extent = chain_extent_deg(pts) if len(focus_stars) > 3 else triangle_extent_deg(pts)
+        sol = compute_solitary_score(focus_stars, center_ra, center_dec, extent, max_mag, row['score'],
+                                     catalog=solitary_catalog)
+        solitary_scores.append(sol)
+    scored = solitary_candidates.with_columns(pl.Series("solitary_score", solitary_scores))
+    # Reuse already-enriched data for solitary top 20
+    enriched_with_sol = all_enriched_500.join(
+        scored.select("score", "stars", "solitary_score"),
+        on=["score", "stars"], how="inner"
+    )
+    solitary_top = enriched_with_sol.sort("solitary_score").head(20)
+    solitary_top = filter_visible_51n(solitary_top).head(10)
+
+    if len(solitary_top) > 0:
+        generate_pdf(solitary_top, outdir, f"{scoring}_solitary_51N",
+                     f"Top 10 solitary - {display_name}", max_mag=max_mag,
+                     shape=shape, instrument_info=inst_info)
+        generate_pifinder_list(solitary_top, outdir, f"{scoring}_solitary_51N",
+                               shape=shape, pifinder_outdir=pifinder_outdir)
+        print(f"  Solitary: {len(solitary_top)} asterisms")
+
+    # Legacy FOV-filtered reports for telescopic triangles
     if subdir_path.startswith("telescopic") and shape == "triangle":
         for fov in [1.0, 0.5]:
             def _extent_fits_fov(v, fov=fov):
@@ -845,7 +1069,206 @@ if __name__ == '__main__':
                 print(f"  No 51N asterisms fit within {fov}\u00b0 FOV, skipping")
                 continue
             generate_pdf(fov_filtered, outdir, f"{scoring}_51N", display_name,
-                         max_mag=max_mag, fov_override=fov, shape=shape)
-            generate_pifinder_list(fov_filtered, outdir, f"{scoring}_fov{fov:.1f}deg_51N", shape=shape)
+                         max_mag=max_mag, fov_override=fov, shape=shape, instrument_info=inst_info)
+            generate_pifinder_list(fov_filtered, outdir, f"{scoring}_fov{fov:.1f}deg_51N",
+                                   shape=shape, pifinder_outdir=pifinder_outdir)
 
- print("\n\nDone! All reports generated.")
+
+def _diverse_top_n(df, n=10):
+    """Pick top N results with at most ceil(N/num_lengths) per chain length.
+
+    Round-robin across chain lengths sorted ascending, picking the best-scored
+    from each in turn until we have N results.
+    """
+    chain_lengths = sorted(df["chain_len"].unique().to_list())
+    per_length = {clen: df.filter(pl.col("chain_len") == clen) for clen in chain_lengths}
+    cursors = {clen: 0 for clen in chain_lengths}
+    selected_rows = []
+    while len(selected_rows) < n:
+        added_this_round = False
+        for clen in chain_lengths:
+            if len(selected_rows) >= n:
+                break
+            clen_df = per_length[clen]
+            idx = cursors[clen]
+            if idx < len(clen_df):
+                selected_rows.append(clen_df.row(idx, named=True))
+                cursors[clen] = idx + 1
+                added_this_round = True
+        if not added_this_round:
+            break
+    if not selected_rows:
+        return df.head(0)
+    return pl.DataFrame(selected_rows, schema=df.schema)
+
+
+def _process_collinear_mode(df, outdir, pifinder_outdir, scoring, max_mag,
+                             display_name, shape, search_config, inst_info, run_dir=None):
+    """Process collinear results with chain-length binning."""
+    chain_lengths = sorted(df["chain_len"].unique().to_list())
+    MAX_PAGES = 20
+
+    # First pass: count visible results per chain length
+    visible_per_clen = {}
+    for clen in chain_lengths:
+        clen_df = df.filter(pl.col("chain_len") == clen).sort("score")
+        enriched = enrich_results(clen_df.head(100), max_mag=max_mag)
+        vis = filter_visible_51n(enriched)
+        if len(vis) > 0:
+            visible_per_clen[clen] = vis
+            print(f"  {clen}-star: {len(vis)} visible")
+        else:
+            print(f"  {clen}-star: 0 visible")
+
+    # Build bins greedily: accumulate chain lengths until ~MAX_PAGES visible
+    bins = []
+    cur_clens = []
+    cur_count = 0
+    for clen in sorted(visible_per_clen.keys()):
+        n_vis = len(visible_per_clen[clen])
+        if n_vis >= MAX_PAGES:
+            if cur_clens:
+                bins.append(cur_clens)
+            bins.append([clen])
+            cur_clens = []
+            cur_count = 0
+        else:
+            cur_clens.append(clen)
+            cur_count += n_vis
+            if cur_count >= MAX_PAGES:
+                bins.append(cur_clens)
+                cur_clens = []
+                cur_count = 0
+    if cur_clens:
+        bins.append(cur_clens)
+
+    # Generate one PDF per bin
+    for bin_clens in bins:
+        if len(bin_clens) == 1:
+            clen = bin_clens[0]
+            bin_name = f"{scoring}_{clen}star"
+            bin_display = f"{display_name} ({clen}-star)"
+        else:
+            bin_name = f"{scoring}_{bin_clens[0]}-{bin_clens[-1]}star"
+            bin_display = f"{display_name} ({bin_clens[0]}-{bin_clens[-1]}-star)"
+
+        bin_visible = pl.concat([visible_per_clen[c] for c in bin_clens])
+        bin_visible = bin_visible.sort("score").head(MAX_PAGES)
+
+        print(f"\n  --- {bin_display}: {len(bin_visible)} pages ---")
+        generate_pdf(bin_visible, outdir, f"{bin_name}_51N",
+                     f"Top {len(bin_visible)} visible from 51\u00b0N - {bin_display}",
+                     max_mag=max_mag, shape=shape, instrument_info=inst_info, scoring=scoring)
+        list_bin_name = bin_name.removeprefix(f"{scoring}_")
+        generate_pifinder_list(bin_visible, outdir, f"{list_bin_name}_51N",
+                               shape=shape, pifinder_outdir=pifinder_outdir)
+
+        for season in SEASONS:
+            seasonal = filter_seasonal(bin_visible, season).head(MAX_PAGES)
+            if len(seasonal) > 0:
+                generate_pifinder_list(seasonal, outdir, f"{list_bin_name}_{season}_51N",
+                                       shape=shape, pifinder_outdir=pifinder_outdir)
+
+    # Combined report (top 10, best per chain length) - use diverse candidate pool
+    sorted_df = df.sort("score")
+    diverse_500 = _diverse_top_n(sorted_df, n=500)
+    all_enriched_500 = enrich_results(diverse_500, max_mag=max_mag)
+    all_enriched = all_enriched_500.head(100)
+    visible = filter_visible_51n(all_enriched)
+    if len(visible) > 0:
+        top10 = _diverse_top_n(visible, n=10)
+        generate_pdf(top10, outdir, f"{scoring}_51N",
+                     f"Top 10 visible from 51\u00b0N - {display_name}",
+                     max_mag=max_mag, shape=shape, instrument_info=inst_info, scoring=scoring)
+        generate_pifinder_list(top10, outdir, "top10_51N", shape=shape, pifinder_outdir=pifinder_outdir)
+
+    # Solitary scoring pass for collinear
+    if run_dir:
+        solitary_candidates = diverse_500
+        solitary_catalog = _prefilter_catalog_for_solitary(solitary_candidates, max_mag)
+        print(f"  Solitary pre-filtered catalog: {len(solitary_catalog):,} stars (from {len(dftycho):,})")
+        solitary_scores = []
+        for row in solitary_candidates.iter_rows(named=True):
+            focus_stars = row['stars']
+            pts = torch.tensor(focus_stars)
+            center_ra = pts[:, 0].mean().item()
+            center_dec = pts[:, 1].mean().item()
+            extent = chain_extent_deg(pts)
+            sol = compute_solitary_score(focus_stars, center_ra, center_dec, extent, max_mag, row['score'],
+                                         catalog=solitary_catalog)
+            solitary_scores.append(sol)
+        scored = solitary_candidates.with_columns(pl.Series("solitary_score", solitary_scores))
+        enriched_with_sol = all_enriched_500.join(
+            scored.select("score", "stars", "solitary_score"),
+            on=["score", "stars"], how="inner"
+        )
+        solitary_visible = filter_visible_51n(enriched_with_sol.sort("solitary_score").head(100))
+        solitary_top = _diverse_top_n(solitary_visible, n=10)
+
+        if len(solitary_top) > 0:
+            generate_pdf(solitary_top, outdir, f"{scoring}_solitary_51N",
+                         f"Top 10 solitary - {display_name}", max_mag=max_mag,
+                         shape=shape, instrument_info=inst_info, scoring=scoring)
+            generate_pifinder_list(solitary_top, outdir, f"{scoring}_solitary_51N",
+                                   shape=shape, pifinder_outdir=pifinder_outdir)
+            print(f"  Solitary: {len(solitary_top)} asterisms")
+
+
+def _prompt_run_name(inst):
+    """Prompt for run name, check if exists, ask to override."""
+    default_name = inst.name
+    name = input(f"Run name [{default_name}]: ").strip() or default_name
+    run_dir = os.path.join(OUTPUT_DIR, name)
+    if os.path.exists(run_dir):
+        resp = input(f"  '{run_dir}' already exists. Override? [y/N]: ").strip().lower()
+        if resp != 'y':
+            print("Aborted.")
+            return None
+    return run_dir
+
+
+def _load_instrument(json_path):
+    """Load InstrumentConfig from a JSON file."""
+    with open(json_path) as f:
+        d = json.load(f)
+    eyepieces = [Eyepiece(**ep) for ep in d.get("eyepieces", [])]
+    camera = Camera(**d["camera"]) if "camera" in d else None
+    return InstrumentConfig(
+        name=d["name"],
+        aperture_mm=d["aperture_mm"],
+        focal_ratio=d["focal_ratio"],
+        sqm=d["sqm"],
+        eyepieces=eyepieces,
+        camera=camera,
+    )
+
+
+if __name__ == '__main__':
+    inst = DEFAULT_INSTRUMENT
+
+    # Check for --instrument-json flag
+    if '--instrument-json' in sys.argv:
+        idx = sys.argv.index('--instrument-json')
+        inst = _load_instrument(sys.argv[idx + 1])
+
+    if '--legacy' in sys.argv:
+        # Legacy preset modes (no run name prompt)
+        run_dir = os.path.join(OUTPUT_DIR, 'legacy')
+        os.makedirs(run_dir, exist_ok=True)
+        for subdir_path, scoring, filename, max_mag, display_name, shape in LEGACY_MODES:
+            _process_mode(subdir_path, scoring, filename, max_mag, display_name, shape,
+                          run_dir=run_dir)
+    else:
+        run_dir = _prompt_run_name(inst)
+        if run_dir is None:
+            sys.exit(0)
+
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"\nOutput directory: {run_dir}")
+
+    inst_modes = _build_instrument_modes(inst)
+    for subdir_path, scoring, filename, max_mag, display_name, shape, cfg, ep in inst_modes:
+        _process_mode(subdir_path, scoring, filename, max_mag, display_name, shape,
+                      search_config=cfg, eyepiece=ep, inst=inst, run_dir=run_dir)
+
+    print(f"\n\nDone! All reports generated in {run_dir}")

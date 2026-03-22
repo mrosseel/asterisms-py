@@ -6,6 +6,7 @@
 #include <pybind11/stl.h>
 #include <hip/hip_runtime.h>
 #include <vector>
+#include <limits>
 
 namespace py = pybind11;
 using at::Tensor;
@@ -16,10 +17,11 @@ extern "C" void launch_square_kernel(
     int* indices,
     int n_stars,
     long long max_quads,
+    float max_dist,
     hipStream_t stream
 );
 
-std::vector<Tensor> square_score_hip(py::object py_stars) {
+std::vector<Tensor> square_score_hip(py::object py_stars, float max_dist = std::numeric_limits<float>::infinity()) {
     Tensor stars = THPVariable_Unpack(py_stars.ptr());
 
     TORCH_CHECK(stars.is_cuda(), "stars must be a CUDA tensor");
@@ -46,6 +48,7 @@ std::vector<Tensor> square_score_hip(py::object py_stars) {
         indices.data_ptr<int>(),
         n_stars,
         max_quads,
+        max_dist,
         stream
     );
 
@@ -59,5 +62,6 @@ std::vector<Tensor> square_score_hip(py::object py_stars) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("square_score", &square_score_hip, "Square scoring with HIP kernel");
+    m.def("square_score", &square_score_hip, "Square scoring with HIP kernel",
+          py::arg("stars"), py::arg("max_dist") = std::numeric_limits<float>::infinity());
 }

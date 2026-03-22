@@ -27,13 +27,14 @@ except (ImportError, OSError) as e:
     print(f"  hip_triangle load error: {e}")
 
 
-def score_triangles_hip(stars_tensor, mode='3d'):
+def score_triangles_hip(stars_tensor, mode='3d', search_radius_deg=None):
     """
     Score all triangles using HIP kernel.
 
     Args:
         stars_tensor: [n_stars, 3] float32 tensor on GPU (RA, Dec, Mag)
         mode: '3d' for Cartesian scoring, '2d' for angular-only
+        search_radius_deg: scale depth axis to match angular extent (for 3d mode)
 
     Returns:
         scores: [n_triangles] float32 tensor of triangle scores
@@ -45,7 +46,7 @@ def score_triangles_hip(stars_tensor, mode='3d'):
     if not stars_tensor.is_cuda:
         raise ValueError("stars_tensor must be on GPU")
 
-    scoring_data = radecmag_to_cartesian(stars_tensor) if mode == '3d' else radecmag_to_angular(stars_tensor)
+    scoring_data = radecmag_to_cartesian(stars_tensor, search_radius_deg=search_radius_deg) if mode == '3d' else radecmag_to_angular(stars_tensor)
     scores, indices = triangle_hip.triangle_score(scoring_data)
 
     # Gather original (RA/Dec/Mag) vertices using indices

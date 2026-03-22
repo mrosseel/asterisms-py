@@ -29,10 +29,10 @@ from generate_reports import (
 N_SAMPLES = 25
 
 CONFIGS = [
-    ("result_collinear_rms.parquet", "telescopic/collinear/rms", "collinear_rms_sampler", "RMS", 15.0),
-    ("result_collinear_msd.parquet", "telescopic/collinear/msd", "collinear_msd_sampler", "MSD", 15.0),
-    ("result_collinear_smooth.parquet", "telescopic/collinear/smooth", "collinear_smooth_sampler", "Smooth", 15.0),
-    ("result_collinear_smooth_mag.parquet", "telescopic/collinear/smooth_mag", "collinear_smooth_mag_sampler", "Smooth+Mag", 15.0),
+    ("results/result_collinear_rms.parquet", "telescopic/collinear/rms", "collinear_rms_sampler", "RMS", 15.0),
+    ("results/result_collinear_msd.parquet", "telescopic/collinear/msd", "collinear_msd_sampler", "MSD", 15.0),
+    ("results/result_collinear_smooth.parquet", "telescopic/collinear/smooth", "collinear_smooth_sampler", "Smooth", 15.0),
+    ("results/result_collinear_smooth_mag.parquet", "telescopic/collinear/smooth_mag", "collinear_smooth_mag_sampler", "Smooth+Mag", 15.0),
 ]
 
 star_positions = earth.at(t).observe(Star.from_dataframe(hip_stars))

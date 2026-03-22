@@ -20,3 +20,11 @@ _docs/
 *.png
 Miniconda*
 reports/
+pifinder_lists/
+output/
+*.log
+*.o
+.direnv/
+.pytest_cache/
+.DS_Store
+nbdev-template*/

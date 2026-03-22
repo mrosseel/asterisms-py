@@ -31,7 +31,8 @@ __global__ void square_score_hip_kernel(
     float* __restrict__ scores,
     int* __restrict__ indices,
     int n_stars,
-    long long max_quads
+    long long max_quads,
+    float max_dist
 ) {
     long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= max_quads) return;
@@ -88,6 +89,17 @@ __global__ void square_score_hip_kernel(
     ex = dx_-bx; ey = dy-by; ez = dz-bz; float d13 = sqrtf(ex*ex+ey*ey+ez*ez);
     ex = dx_-cx; ey = dy-cy; ez = dz-cz; float d23 = sqrtf(ex*ex+ey*ey+ez*ez);
 
+    // Early exit: skip quads where any pair exceeds max distance
+    float max_pair = fmaxf(d01, fmaxf(d02, fmaxf(d03, fmaxf(d12, fmaxf(d13, d23)))));
+    if (max_pair > max_dist) {
+        scores[tid] = 1e30f;
+        indices[tid * 4 + 0] = a;
+        indices[tid * 4 + 1] = b;
+        indices[tid * 4 + 2] = c;
+        indices[tid * 4 + 3] = d;
+        return;
+    }
+
     // Test all 3 quadrilateral cycles, pick best score
     // Cycle A-B-C-D: sides AB,BC,CD,DA; diags AC,BD
     float s1 = score_cycle(d01, d02, d03, d12, d13, d23,
@@ -115,6 +127,7 @@ extern "C" void launch_square_kernel(
     int* indices,
     int n_stars,
     long long max_quads,
+    float max_dist,
     hipStream_t stream
 ) {
     int threads_per_block = 256;
@@ -126,6 +139,6 @@ extern "C" void launch_square_kernel(
         dim3(threads_per_block),
         0,
         stream,
-        stars, scores, indices, n_stars, max_quads
+        stars, scores, indices, n_stars, max_quads, max_dist
     );
 }
