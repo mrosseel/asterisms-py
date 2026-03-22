@@ -1,6 +1,5 @@
 """Generate PDF reports and PiFinder observing lists from parquet results."""
 import json
-import math
 import os
 import sys
 import datetime
@@ -22,7 +21,7 @@ from skyfield.projections import build_stereographic_projection
 
 from asterisms_py.core import (
     stars_for_center_and_radius, triangle_extent_deg, chain_extent_deg,
-    dedup_results,
+    dedup_results, camera_fov,
     DEFAULT_INSTRUMENT, instrument_search_configs,
     eyepiece_to_search_config, camera_to_search_config,
     InstrumentConfig, Eyepiece, Camera,
@@ -929,9 +928,9 @@ def _build_instrument_modes(inst):
 
 def _instrument_info_str(inst, ep, cfg):
     """Build instrument info string for PDF display."""
-    scope_fl = inst.aperture_mm * inst.focal_ratio
+    fl = inst.focal_length_mm
     if ep is not None:
-        magnification = scope_fl / ep.focal_length_mm
+        magnification = fl / ep.focal_length_mm
         tfov = ep.afov_deg / magnification
         return (
             f"{inst.aperture_mm:.0f}mm f/{inst.focal_ratio:.0f}  |  "
@@ -940,10 +939,7 @@ def _instrument_info_str(inst, ep, cfg):
             f"LM {cfg.max_mag}  |  SQM {inst.sqm}"
         )
     cam = inst.camera
-    sensor_w = cam.res_x * cam.pixel_size_um / 1000
-    sensor_h = cam.res_y * cam.pixel_size_um / 1000
-    fov_w = 2 * math.degrees(math.atan(sensor_w / (2 * scope_fl)))
-    fov_h = 2 * math.degrees(math.atan(sensor_h / (2 * scope_fl)))
+    fov_w, fov_h = camera_fov(cam, fl)
     return (
         f"{inst.aperture_mm:.0f}mm f/{inst.focal_ratio:.0f}  |  "
         f"{cam.name} ({cam.res_x}\u00d7{cam.res_y})  |  "
@@ -1227,29 +1223,14 @@ def _prompt_run_name(inst):
     return run_dir
 
 
-def _load_instrument(json_path):
-    """Load InstrumentConfig from a JSON file."""
-    with open(json_path) as f:
-        d = json.load(f)
-    eyepieces = [Eyepiece(**ep) for ep in d.get("eyepieces", [])]
-    camera = Camera(**d["camera"]) if "camera" in d else None
-    return InstrumentConfig(
-        name=d["name"],
-        aperture_mm=d["aperture_mm"],
-        focal_ratio=d["focal_ratio"],
-        sqm=d["sqm"],
-        eyepieces=eyepieces,
-        camera=camera,
-    )
-
-
 if __name__ == '__main__':
     inst = DEFAULT_INSTRUMENT
 
     # Check for --instrument-json flag
     if '--instrument-json' in sys.argv:
         idx = sys.argv.index('--instrument-json')
-        inst = _load_instrument(sys.argv[idx + 1])
+        with open(sys.argv[idx + 1]) as f:
+            inst = InstrumentConfig.from_dict(json.load(f))
 
     if '--legacy' in sys.argv:
         # Legacy preset modes (no run name prompt)

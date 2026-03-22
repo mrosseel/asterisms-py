@@ -15,10 +15,14 @@ import struct
 import time
 from pathlib import Path
 
-import mmap
 import numpy as np
 import polars as pl
 from scipy.spatial import cKDTree
+
+from support.gaia_to_parquet import (
+    iter_all_tiles, TILE_HEADER_FORMAT, TILE_HEADER_SIZE,
+    STAR_RECORD_DTYPE, STAR_RECORD_SIZE,
+)
 
 # --- Configuration ---
 
@@ -101,50 +105,6 @@ def propagate_positions(df: pl.DataFrame, target_epoch: float, source_epoch: flo
 
 
 # --- Gaia extraction from PiFinder tiles ---
-
-TILE_HEADER_FORMAT = "<IH"
-TILE_HEADER_SIZE = 6
-STAR_RECORD_DTYPE = np.dtype([
-    ("ra_offset", "u1"),
-    ("dec_offset", "u1"),
-    ("mag", "u1"),
-])
-STAR_RECORD_SIZE = 3
-
-
-def iter_all_tiles(index_path: Path, tiles_path: Path):
-    """Iterate all tiles, yielding (tile_id, tile_data) pairs."""
-    with open(index_path, "rb") as f:
-        index_data = f.read()
-
-    version, num_tiles, num_runs = struct.unpack_from("<III", index_data, 0)
-    if version != 3:
-        raise ValueError(f"Unsupported index version: {version}")
-
-    runs = []
-    pos = 12
-    for _ in range(num_runs):
-        start_tile, data_offset = struct.unpack_from("<IQ", index_data, pos)
-        runs.append((start_tile, data_offset))
-        pos += 12
-
-    with open(tiles_path, "rb") as f:
-        tiles_mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-
-    for start_tile, data_offset in runs:
-        run_length, offset_base = struct.unpack_from("<HQ", index_data, data_offset)
-        sizes_data = index_data[data_offset + 10: data_offset + 10 + run_length * 2]
-        sizes = struct.unpack(f"<{run_length}H", sizes_data)
-
-        tile_offset = offset_base
-        for i, size in enumerate(sizes):
-            if size > 0:
-                tile_id = start_tile + i
-                yield tile_id, tiles_mm[tile_offset:tile_offset + size]
-            tile_offset += size
-
-    tiles_mm.close()
-
 
 def extract_gaia_stars(catalog_path: Path, max_mag: float) -> pl.DataFrame:
     """Extract Gaia stars from PiFinder HEALPix tiles."""

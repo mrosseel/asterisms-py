@@ -4,18 +4,18 @@
 
 # %% auto 0
 __all__ = ['torch_lib_path', 'NAKED_EYE', 'BINOCULAR', 'TELESCOPIC', 'DEFAULT_INSTRUMENT', 'SCORE_CUTOFFS', 'resultdf', 'schema',
-           'SearchConfig', 'Eyepiece', 'Camera', 'InstrumentConfig', 'sqm_to_nelm', 'telescope_limiting_mag',
-           'eyepiece_to_search_config', 'camera_to_search_config', 'instrument_search_configs', 'ScoreItem', 'Points',
-           'convert_to_cartesian', 'calculate_distances', 'distance_from_magnitude', 'distance_from_magnitude_tensor',
-           'tetrahedron_score', 'square_score', 'measure_squareness_old', 'measure_squareness', 'radecmag_to_cartesian',
-           'radecmag_to_angular', 'mass_score_triangle_torch', 'mass_score_square_torch',
-           'transform_radecmag_from_numpy', 'global_normalize_tensor', 'radec_normalize_tensor', 'mag_score',
-           'score_triangle', 'triangle_extent_deg', 'triangle_extent_deg_batch', 'shape_extent_deg_batch',
-           'compute_tilt_batch', 'chain_extent_deg', 'score_collinear_region', 'process_collinear_regions',
-           'stars_for_point_and_radius', 'stars_for_center_and_radius', 'get_grid_points', 'get_grid_point_by_idx',
-           'get_region', 'get_center', 'ra_to_hms', 'load_catalog_to_gpu', 'reset_gpu_catalog', 'filter_stars_on_gpu',
-           'vectorized_filter_batch', 'process', 'add_to_result_and_save', 'add_compact_score', 'dedup_results',
-           'process_all_regions']
+           'SearchConfig', 'Eyepiece', 'Camera', 'InstrumentConfig', 'camera_fov', 'sqm_to_nelm',
+           'telescope_limiting_mag', 'eyepiece_to_search_config', 'camera_to_search_config',
+           'instrument_search_configs', 'ScoreItem', 'Points', 'convert_to_cartesian', 'calculate_distances',
+           'distance_from_magnitude', 'distance_from_magnitude_tensor', 'tetrahedron_score', 'square_score',
+           'measure_squareness_old', 'measure_squareness', 'radecmag_to_cartesian', 'radecmag_to_angular',
+           'mass_score_triangle_torch', 'mass_score_square_torch', 'transform_radecmag_from_numpy',
+           'global_normalize_tensor', 'radec_normalize_tensor', 'mag_score', 'score_triangle', 'triangle_extent_deg',
+           'triangle_extent_deg_batch', 'shape_extent_deg_batch', 'compute_tilt_batch', 'chain_extent_deg',
+           'score_collinear_region', 'process_collinear_regions', 'stars_for_point_and_radius',
+           'stars_for_center_and_radius', 'get_grid_points', 'get_grid_point_by_idx', 'get_region', 'get_center',
+           'ra_to_hms', 'load_catalog_to_gpu', 'reset_gpu_catalog', 'filter_stars_on_gpu', 'vectorized_filter_batch',
+           'process', 'add_to_result_and_save', 'add_compact_score', 'dedup_results', 'process_all_regions']
 
 # %% ../nbs/01a_core.ipynb 2
 import os
@@ -79,6 +79,39 @@ class InstrumentConfig:
     eyepieces: list = field(default_factory=list)
     camera: Camera = None
 
+    @property
+    def focal_length_mm(self):
+        return self.aperture_mm * self.focal_ratio
+
+    def to_dict(self):
+        d = {
+            "name": self.name,
+            "aperture_mm": self.aperture_mm,
+            "focal_ratio": self.focal_ratio,
+            "sqm": self.sqm,
+            "eyepieces": [{"focal_length_mm": ep.focal_length_mm, "afov_deg": ep.afov_deg}
+                          for ep in self.eyepieces],
+        }
+        if self.camera:
+            d["camera"] = {
+                "name": self.camera.name,
+                "pixel_size_um": self.camera.pixel_size_um,
+                "res_x": self.camera.res_x,
+                "res_y": self.camera.res_y,
+                "limiting_mag": self.camera.limiting_mag,
+            }
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        eyepieces = [Eyepiece(**ep) for ep in d.get("eyepieces", [])]
+        camera = Camera(**d["camera"]) if "camera" in d else None
+        return cls(
+            name=d["name"], aperture_mm=d["aperture_mm"],
+            focal_ratio=d["focal_ratio"], sqm=d["sqm"],
+            eyepieces=eyepieces, camera=camera,
+        )
+
 DEFAULT_INSTRUMENT = InstrumentConfig(
     name="10in_f5",
     aperture_mm=254,
@@ -93,6 +126,14 @@ DEFAULT_INSTRUMENT = InstrumentConfig(
     ],
 )
 
+def camera_fov(cam, focal_length_mm):
+    """Compute camera sensor FOV in degrees. Returns (fov_w, fov_h)."""
+    sensor_w = cam.res_x * cam.pixel_size_um / 1000
+    sensor_h = cam.res_y * cam.pixel_size_um / 1000
+    fov_w = 2 * math.degrees(math.atan(sensor_w / (2 * focal_length_mm)))
+    fov_h = 2 * math.degrees(math.atan(sensor_h / (2 * focal_length_mm)))
+    return fov_w, fov_h
+
 def sqm_to_nelm(sqm):
     """SQM reading to naked-eye limiting magnitude."""
     return 7.93 - 5 * math.log10(10**(4.316 - sqm / 5) + 1)
@@ -105,10 +146,9 @@ def telescope_limiting_mag(aperture_mm, exit_pupil_mm, nelm):
 
 def eyepiece_to_search_config(inst, ep, max_stars_per_region=200):
     """Derive a SearchConfig from instrument + eyepiece physical specs."""
-    scope_fl = inst.aperture_mm * inst.focal_ratio
-    magnification = scope_fl / ep.focal_length_mm
+    magnification = inst.focal_length_mm / ep.focal_length_mm
     tfov = ep.afov_deg / magnification
-    exit_pupil = min(ep.focal_length_mm / inst.focal_ratio, 7.0)  # clamp to dark-adapted pupil
+    exit_pupil = min(ep.focal_length_mm / inst.focal_ratio, 7.0)
     nelm = sqm_to_nelm(inst.sqm)
     lm = telescope_limiting_mag(inst.aperture_mm, exit_pupil, nelm)
     search_radius = round(tfov * 0.85, 2)
@@ -123,17 +163,12 @@ def eyepiece_to_search_config(inst, ep, max_stars_per_region=200):
 
 def camera_to_search_config(inst, max_stars_per_region=200):
     """Derive a SearchConfig from instrument + camera sensor specs."""
-    cam = inst.camera
-    scope_fl = inst.aperture_mm * inst.focal_ratio
-    sensor_w_mm = cam.res_x * cam.pixel_size_um / 1000
-    sensor_h_mm = cam.res_y * cam.pixel_size_um / 1000
-    fov_w = 2 * math.degrees(math.atan(sensor_w_mm / (2 * scope_fl)))
-    fov_h = 2 * math.degrees(math.atan(sensor_h_mm / (2 * scope_fl)))
+    fov_w, fov_h = camera_fov(inst.camera, inst.focal_length_mm)
     tfov_short = min(fov_w, fov_h)
     search_radius = round(tfov_short * 0.85, 2)
     return SearchConfig(
-        name=f"{inst.name}_{cam.name}",
-        max_mag=cam.limiting_mag,
+        name=f"{inst.name}_{inst.camera.name}",
+        max_mag=inst.camera.limiting_mag,
         max_extent_deg=search_radius,
         grid_step_deg=max(0.3, round(search_radius * 0.6, 1)),
         search_radius_deg=search_radius,

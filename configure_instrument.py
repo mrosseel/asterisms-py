@@ -9,7 +9,6 @@ Usage:
 """
 import argparse
 import json
-import math
 import os
 import subprocess
 import sys
@@ -18,7 +17,7 @@ from dataclasses import replace
 
 from asterisms_py.core import (
     InstrumentConfig, Eyepiece, Camera, DEFAULT_INSTRUMENT,
-    eyepiece_to_search_config, camera_to_search_config,
+    eyepiece_to_search_config, camera_to_search_config, camera_fov,
     sqm_to_nelm, telescope_limiting_mag,
 )
 
@@ -92,16 +91,16 @@ COMMON_EYEPIECES = {
 
 def _show_eyepiece_table(inst):
     """Display derived search parameters for each eyepiece and/or camera."""
-    scope_fl = inst.aperture_mm * inst.focal_ratio
+    fl = inst.focal_length_mm
     nelm = sqm_to_nelm(inst.sqm)
     print(f"\n  {inst.name}: {inst.aperture_mm:.0f}mm f/{inst.focal_ratio:.0f} "
-          f"(FL {scope_fl:.0f}mm), SQM {inst.sqm}, NELM {nelm:.1f}")
+          f"(FL {fl:.0f}mm), SQM {inst.sqm}, NELM {nelm:.1f}")
 
     if inst.eyepieces:
         print(f"  {'EP':>6}  {'AFOV':>5}  {'Mag':>4}  {'TFOV':>6}  {'Exit':>5}  {'LM':>5}  {'Radius':>7}  {'Grid':>5}")
         print(f"  {'-'*6}  {'-'*5}  {'-'*4}  {'-'*6}  {'-'*5}  {'-'*5}  {'-'*7}  {'-'*5}")
         for ep in inst.eyepieces:
-            mag = scope_fl / ep.focal_length_mm
+            mag = fl / ep.focal_length_mm
             tfov = ep.afov_deg / mag
             exit_pupil = ep.focal_length_mm / inst.focal_ratio
             cfg = eyepiece_to_search_config(inst, ep)
@@ -110,11 +109,8 @@ def _show_eyepiece_table(inst):
 
     if inst.camera:
         cam = inst.camera
-        sensor_w = cam.res_x * cam.pixel_size_um / 1000
-        sensor_h = cam.res_y * cam.pixel_size_um / 1000
-        fov_w = 2 * math.degrees(math.atan(sensor_w / (2 * scope_fl)))
-        fov_h = 2 * math.degrees(math.atan(sensor_h / (2 * scope_fl)))
-        plate_scale = cam.pixel_size_um / scope_fl * 206.265
+        fov_w, fov_h = camera_fov(cam, fl)
+        plate_scale = cam.pixel_size_um / fl * 206.265
         cfg = camera_to_search_config(inst)
         print(f"  Camera: {cam.name} ({cam.res_x}x{cam.res_y}, {cam.pixel_size_um}µm)")
         print(f"    FOV {fov_w:.2f}° x {fov_h:.2f}°, plate scale {plate_scale:.2f}\"/px")
@@ -176,8 +172,7 @@ def _configure_interactive():
     print("\n=== Telescope Configuration ===\n")
     print("  Presets available:")
     for name, inst in PRESETS.items():
-        scope_fl = inst.aperture_mm * inst.focal_ratio
-        parts = f"{inst.aperture_mm:.0f}mm f/{inst.focal_ratio:.0f} (FL {scope_fl:.0f}mm)"
+        parts = f"{inst.aperture_mm:.0f}mm f/{inst.focal_ratio:.0f} (FL {inst.focal_length_mm:.0f}mm)"
         if inst.eyepieces:
             parts += f", {len(inst.eyepieces)} eyepieces"
         if inst.camera:
@@ -207,7 +202,6 @@ def _configure_interactive():
     fratio = _input_float("Focal ratio (f/)", 5)
     sqm = _input_float("Sky quality (SQM)", 20)
 
-    scope_fl = aperture * fratio
     name_default = f"{aperture:.0f}mm_f{fratio:.0f}"
     name = input(f"  Name [{name_default}]: ").strip() or name_default
 
@@ -377,30 +371,9 @@ def _run_pipeline(inst):
     print(f"\nPipeline done in {total_elapsed/60:.1f} minutes.")
 
 
-def _instrument_to_dict(inst):
-    """Serialize InstrumentConfig to a JSON-compatible dict."""
-    d = {
-        "name": inst.name,
-        "aperture_mm": inst.aperture_mm,
-        "focal_ratio": inst.focal_ratio,
-        "sqm": inst.sqm,
-        "eyepieces": [{"focal_length_mm": ep.focal_length_mm, "afov_deg": ep.afov_deg}
-                      for ep in inst.eyepieces],
-    }
-    if inst.camera:
-        d["camera"] = {
-            "name": inst.camera.name,
-            "pixel_size_um": inst.camera.pixel_size_um,
-            "res_x": inst.camera.res_x,
-            "res_y": inst.camera.res_y,
-            "limiting_mag": inst.camera.limiting_mag,
-        }
-    return d
-
-
 def _run_reports(inst, run_name, overwrite=False):
     """Generate reports, passing instrument config via temp JSON file."""
-    inst_dict = _instrument_to_dict(inst)
+    inst_dict = inst.to_dict()
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
         json.dump(inst_dict, f)
         inst_json_path = f.name
