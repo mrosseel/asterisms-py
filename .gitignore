@@ -28,3 +28,4 @@ output/
 .pytest_cache/
 .DS_Store
 nbdev-template*/
+cache/

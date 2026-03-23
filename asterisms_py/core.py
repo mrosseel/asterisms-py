@@ -153,7 +153,7 @@ def eyepiece_to_search_config(inst, ep, max_stars_per_region=200):
     lm = telescope_limiting_mag(inst.aperture_mm, exit_pupil, nelm)
     search_radius = round(tfov * 0.85, 2)
     return SearchConfig(
-        name=f"{inst.name}_{ep.focal_length_mm:.0f}mm",
+        name=f"{inst.name}_{ep.focal_length_mm:.0f}mm_mag{round(lm, 1)}",
         max_mag=round(lm, 1),
         max_extent_deg=search_radius,
         grid_step_deg=max(1, round(search_radius * 0.6, 1)),
@@ -167,7 +167,7 @@ def camera_to_search_config(inst, max_stars_per_region=200):
     tfov_short = min(fov_w, fov_h)
     search_radius = round(tfov_short * 0.85, 2)
     return SearchConfig(
-        name=f"{inst.name}_{inst.camera.name}",
+        name=f"{inst.name}_{inst.camera.name}_mag{inst.camera.limiting_mag}",
         max_mag=inst.camera.limiting_mag,
         max_extent_deg=search_radius,
         grid_step_deg=max(0.3, round(search_radius * 0.6, 1)),

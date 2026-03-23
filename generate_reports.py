@@ -4,10 +4,14 @@ import os
 import sys
 import datetime
 import traceback
+from io import BytesIO
+
 import numpy as np
 import polars as pl
+import requests
 import torch
 import pandas
+from PIL import Image, ImageOps
 
 from matplotlib import pyplot as plt
 from matplotlib.collections import LineCollection
@@ -97,6 +101,115 @@ def _compute_star_colors(bt_arr, vt_arr):
     """Compute RGB colors from BTmag and VTmag arrays."""
     bv = bt_arr - vt_arr
     return [bv_to_rgb(b) for b in bv]
+
+
+# --- POSS sky survey image support ---
+
+SKYVIEW_URL = (
+    "https://skyview.gsfc.nasa.gov/current/cgi/runquery.pl"
+    "?Survey=digitized+sky+survey&position={ra},{dec}"
+    "&Return=JPEG&size={size}&pixels=1024"
+)
+
+POSS_CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache", "poss")
+
+_poss_session = None
+
+def _get_poss_session():
+    global _poss_session
+    if _poss_session is None:
+        _poss_session = requests.Session()
+        _poss_session.headers["User-Agent"] = "asterisms-py/1.0"
+    return _poss_session
+
+
+def _poss_cache_path(ra_deg, dec_deg, fov_deg):
+    """Build cache filename from coordinates and FOV, rounded to avoid near-duplicates."""
+    ra_key = round(ra_deg, 3)
+    dec_key = round(dec_deg, 3)
+    fov_key = round(fov_deg, 2)
+    return os.path.join(POSS_CACHE_DIR, f"poss_{ra_key}_{dec_key}_{fov_key}.jpg")
+
+
+def fetch_poss_image(ra_deg, dec_deg, fov_deg):
+    """Fetch a POSS/DSS image, using local cache when available."""
+    cache_file = _poss_cache_path(ra_deg, dec_deg, fov_deg)
+
+    if os.path.exists(cache_file):
+        try:
+            return Image.open(cache_file).convert('L')
+        except Exception:
+            pass  # corrupted cache file, re-fetch
+
+    url = SKYVIEW_URL.format(ra=ra_deg, dec=dec_deg, size=fov_deg)
+    try:
+        resp = _get_poss_session().get(url, timeout=60)
+        if resp.status_code != 200:
+            return None
+        img = Image.open(BytesIO(resp.content)).convert('L')
+        img = ImageOps.autocontrast(img, cutoff=2)
+
+        os.makedirs(POSS_CACHE_DIR, exist_ok=True)
+        img.save(cache_file, "JPEG", quality=90)
+        return img
+    except Exception as e:
+        print(f"  POSS fetch failed: {e}")
+        return None
+
+
+def _poss_edge_with_gap(ax, ra0, dec0, ra1, dec1, gap_frac=0.12):
+    """Draw a line between two points with gaps near each endpoint."""
+    dx = ra1 - ra0
+    dy = dec1 - dec0
+    length = np.hypot(dx, dy)
+    if length < 1e-10:
+        return
+    frac0 = min(gap_frac, 0.3)
+    frac1 = min(gap_frac, 0.3)
+    sx = ra0 + dx * frac0
+    sy = dec0 + dy * frac0
+    ex = ra1 - dx * frac1
+    ey = dec1 - dy * frac1
+    ax.plot([sx, ex], [sy, ey], color='#ffdd44', linewidth=1.0, alpha=0.7, zorder=9)
+
+
+def _draw_poss_overlay(ax, poss_img, center_ra, center_dec, fov_deg, focus_stars, shape):
+    """Draw POSS image with shape edges overlaid (no star markers, gapped lines)."""
+    half = fov_deg / 2.0
+    cos_dec = max(0.1, np.cos(np.radians(center_dec)))
+    ra_half = half / cos_dec
+
+    # Display image: RA increases to the left (standard sky orientation)
+    ax.imshow(poss_img, cmap='gray', origin='upper',
+              extent=[center_ra + ra_half, center_ra - ra_half,
+                      center_dec - half, center_dec + half],
+              aspect='auto')
+
+    star_ras = [s[0] for s in focus_stars]
+    star_decs = [s[1] for s in focus_stars]
+    n = len(focus_stars)
+
+    # For squares, sort vertices by angle from centroid for proper polygon order
+    if shape == 'square' and n == 4:
+        cx = np.mean(star_ras)
+        cy = np.mean(star_decs)
+        angles = [np.arctan2(d - cy, r - cx) for r, d in zip(star_ras, star_decs)]
+        order = np.argsort(angles)
+        star_ras = [star_ras[k] for k in order]
+        star_decs = [star_decs[k] for k in order]
+
+    n_edges = n - 1 if shape == 'collinear' else n
+    for i in range(n_edges):
+        j = (i + 1) if shape == 'collinear' else (i + 1) % n
+        _poss_edge_with_gap(ax, star_ras[i], star_decs[i], star_ras[j], star_decs[j])
+
+    ax.set_xlim(center_ra + ra_half, center_ra - ra_half)
+    ax.set_ylim(center_dec - half, center_dec + half)
+    ax.set_aspect(1.0 / cos_dec)
+    ax.xaxis.set_visible(False)
+    ax.yaxis.set_visible(False)
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#333333')
 
 
 # --- Enrichment functions ---
@@ -555,9 +668,18 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
                 xy2 = hip_stars_copy[['x', 'y']].loc[edges_star2].values
                 lines_xy = np.rollaxis(np.array([xy1, xy2]), 1)
 
-                fig = plt.figure(figsize=[8.5, 11])
-                fig.patch.set_facecolor('#111111')
-                gs = gridspec.GridSpec(2, 1, height_ratios=[3, 2.5], hspace=0.25)
+                # Fetch POSS sky survey image
+                poss_fov = max(0.5, extent * 2.0)
+                poss_img = fetch_poss_image(center_coord[0], center_coord[1], poss_fov)
+
+                if poss_img:
+                    fig = plt.figure(figsize=[8.5, 14])
+                    fig.patch.set_facecolor('#111111')
+                    gs = gridspec.GridSpec(3, 1, height_ratios=[3, 2.5, 2.5], hspace=0.20)
+                else:
+                    fig = plt.figure(figsize=[8.5, 11])
+                    fig.patch.set_facecolor('#111111')
+                    gs = gridspec.GridSpec(2, 1, height_ratios=[3, 2.5], hspace=0.25)
 
                 # --- Finder chart (dark mode) ---
                 ax_chart = fig.add_subplot(gs[0])
@@ -608,8 +730,17 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
                              fontsize=8, color='#aaaaaa', fontfamily='monospace',
                              verticalalignment='bottom')
 
+                # --- POSS sky survey image panel ---
+                if poss_img:
+                    ax_poss = fig.add_subplot(gs[1])
+                    ax_poss.set_facecolor('black')
+                    _draw_poss_overlay(ax_poss, poss_img, center_coord[0], center_coord[1],
+                                       poss_fov, focus_stars, shape)
+                    ax_poss.set_title("POSS / Digitized Sky Survey", fontsize=10, color='#999999')
+
                 # --- Info panel (dark mode) ---
-                ax_info = fig.add_subplot(gs[1])
+                info_gs_idx = 2 if poss_img else 1
+                ax_info = fig.add_subplot(gs[info_gs_idx])
                 ax_info.set_facecolor('#111111')
                 ax_info.axis('off')
 
