@@ -4,7 +4,7 @@
 
 # %% auto 0
 __all__ = ['torch_lib_path', 'NAKED_EYE', 'BINOCULAR', 'TELESCOPIC', 'DEFAULT_INSTRUMENT', 'SCORE_CUTOFFS', 'resultdf', 'schema',
-           'SearchConfig', 'Eyepiece', 'Camera', 'InstrumentConfig', 'camera_fov', 'sqm_to_nelm',
+           'SHAPE_ABBREV', 'SearchConfig', 'Eyepiece', 'Camera', 'InstrumentConfig', 'camera_fov', 'sqm_to_nelm',
            'telescope_limiting_mag', 'eyepiece_to_search_config', 'camera_to_search_config',
            'instrument_search_configs', 'ScoreItem', 'Points', 'convert_to_cartesian', 'calculate_distances',
            'distance_from_magnitude', 'distance_from_magnitude_tensor', 'tetrahedron_score', 'square_score',
@@ -12,10 +12,11 @@ __all__ = ['torch_lib_path', 'NAKED_EYE', 'BINOCULAR', 'TELESCOPIC', 'DEFAULT_IN
            'mass_score_triangle_torch', 'mass_score_square_torch', 'transform_radecmag_from_numpy',
            'global_normalize_tensor', 'radec_normalize_tensor', 'mag_score', 'score_triangle', 'triangle_extent_deg',
            'triangle_extent_deg_batch', 'shape_extent_deg_batch', 'compute_tilt_batch', 'chain_extent_deg',
-           'score_collinear_region', 'process_collinear_regions', 'stars_for_point_and_radius',
+           'score_collinear_region', 'process_collinear_regions', 'compute_chain_corridor_flux',
+           'score_bright_isolated_chains', 'process_circle_regions', 'stars_for_point_and_radius',
            'stars_for_center_and_radius', 'get_grid_points', 'get_grid_point_by_idx', 'get_region', 'get_center',
            'ra_to_hms', 'load_catalog_to_gpu', 'reset_gpu_catalog', 'filter_stars_on_gpu', 'vectorized_filter_batch',
-           'process', 'add_to_result_and_save', 'add_compact_score', 'dedup_results', 'process_all_regions']
+           'process', 'add_compact_score', 'dedup_results', 'asterism_id', 'assign_asterism_ids', 'process_all_regions']
 
 # %% ../nbs/01a_core.ipynb 2
 import os
@@ -287,6 +288,136 @@ def radecmag_to_angular(points_tensor):
     return torch.stack([x, y, z], dim=1)
 
 # %% ../nbs/01a_core.ipynb 8
+def _pruned_triangle_indices_gpu(scoring_coords, cv_threshold=0.10):
+    """GPU-vectorized distance-bucket triangle pruning.
+    
+    For each pair (i,j) at distance d, find k where dist(i,k)~d AND dist(j,k)~d.
+    Reduces C(N,3) to a fraction of candidates while capturing 100% of
+    equilateral triangles with cv < threshold.
+    
+    Falls back to torch.combinations for N <= 300 where brute force is faster.
+    """
+    N = scoring_coords.shape[0]
+    device = scoring_coords.device
+    
+    if N <= 300:
+        return torch.combinations(torch.arange(N, device=device), r=3)
+    
+    dist = torch.cdist(scoring_coords, scoring_coords)
+    
+    candidates = []
+    for i in range(N - 2):
+        dists_i = dist[i]
+        j_start = i + 1
+        d_ij = dists_i[j_start:N]
+        tol = cv_threshold * d_ij
+        
+        for j_local in range(len(d_ij) - 1):
+            j = j_start + j_local
+            d = d_ij[j_local]
+            if d < 1e-12:
+                continue
+            t = tol[j_local]
+            
+            k_slice = slice(j + 1, N)
+            mask = (torch.abs(dists_i[k_slice] - d) < t) & (torch.abs(dist[j, k_slice] - d) < t)
+            k_hits = torch.where(mask)[0] + (j + 1)
+            
+            if len(k_hits) > 0:
+                triplets = torch.stack([
+                    torch.full_like(k_hits, i),
+                    torch.full_like(k_hits, j),
+                    k_hits
+                ], dim=1)
+                candidates.append(triplets)
+    
+    if not candidates:
+        return torch.zeros((0, 3), dtype=torch.long, device=device)
+    return torch.cat(candidates, dim=0)
+
+
+def _pruned_square_indices(scoring_coords, tol_frac=0.20):
+    """GPU rotation-based square candidate finder.
+    
+    For each pair (i,j) treated as a diagonal, rotate the half-diagonal by 90°
+    to predict where the other two vertices should be. Find nearest stars to
+    those predicted positions. O(N^2) pairs × O(N) nearest-neighbor on GPU.
+    
+    Captures ~90-95% of top squares with 5000-50000x candidate reduction.
+    Falls back to torch.combinations for N <= 80.
+    """
+    N = scoring_coords.shape[0]
+    device = scoring_coords.device
+    
+    if N <= 80:
+        return torch.combinations(torch.arange(N, device=device), r=4)
+    
+    coords_2d = scoring_coords[:, :2] if scoring_coords.shape[1] > 2 else scoring_coords
+    
+    ii, jj = torch.triu_indices(N, N, offset=1, device=device)
+    n_pairs = ii.shape[0]
+    
+    mid = (coords_2d[ii] + coords_2d[jj]) / 2
+    half_diag = (coords_2d[jj] - coords_2d[ii]) / 2
+    hd_len = torch.linalg.norm(half_diag, dim=1)
+    
+    # Rotate half-diagonal by 90° to predict other two vertices
+    rotated = torch.stack([-half_diag[:, 1], half_diag[:, 0]], dim=1)
+    expected_k = mid + rotated
+    expected_l = mid - rotated
+    
+    batch_size = 50000
+    all_quads_i = []
+    all_quads_j = []
+    all_quads_k = []
+    all_quads_l = []
+    
+    for start in range(0, n_pairs, batch_size):
+        end = min(start + batch_size, n_pairs)
+        
+        dist_k = torch.cdist(expected_k[start:end], coords_2d)
+        dist_l = torch.cdist(expected_l[start:end], coords_2d)
+        
+        tol = tol_frac * hd_len[start:end]
+        
+        min_dk, nearest_k = dist_k.min(dim=1)
+        min_dl, nearest_l = dist_l.min(dim=1)
+        
+        mask = (min_dk < tol) & (min_dl < tol)
+        
+        if mask.any():
+            valid = torch.where(mask)[0]
+            p = valid + start
+            qi = ii[p]
+            qj = jj[p]
+            qk = nearest_k[valid]
+            ql = nearest_l[valid]
+            
+            # Filter: 4 distinct vertices
+            distinct = (qi != qk) & (qi != ql) & (qj != qk) & (qj != ql) & (qk != ql)
+            if distinct.any():
+                d_idx = torch.where(distinct)[0]
+                all_quads_i.append(qi[d_idx])
+                all_quads_j.append(qj[d_idx])
+                all_quads_k.append(qk[d_idx])
+                all_quads_l.append(ql[d_idx])
+    
+    if not all_quads_i:
+        return torch.zeros((0, 4), dtype=torch.long, device=device)
+    
+    qi = torch.cat(all_quads_i)
+    qj = torch.cat(all_quads_j)
+    qk = torch.cat(all_quads_k)
+    ql = torch.cat(all_quads_l)
+    
+    # Sort vertices per quad and deduplicate
+    quads = torch.stack([qi, qj, qk, ql], dim=1)
+    quads = quads.sort(dim=1).values
+    quads = torch.unique(quads, dim=0)
+    
+    return quads
+
+
 def mass_score_triangle_torch(points_tensor, device='cpu', mode='3d', search_radius_deg=None):
     points_tensor = points_tensor.to(device)
 
@@ -295,7 +426,12 @@ def mass_score_triangle_torch(points_tensor, device='cpu', mode='3d', search_rad
     else:
         scoring_coords = radecmag_to_angular(points_tensor)
 
-    idx_combinations = torch.combinations(torch.arange(scoring_coords.shape[0]), r=3)
+    idx_combinations = _pruned_triangle_indices_gpu(scoring_coords)
+
+    if len(idx_combinations) == 0:
+        empty_scores = torch.zeros(0, device=device)
+        empty_points = torch.zeros((0, 3, 3), device=device)
+        return empty_scores, empty_points
 
     p1 = scoring_coords[idx_combinations[:, 0]]
     p2 = scoring_coords[idx_combinations[:, 1]]
@@ -331,10 +467,10 @@ _QUAD_CYCLES = [
 
 
 def mass_score_square_torch(points_tensor, device='cpu', mode='3d', search_radius_deg=None):
-    """Score all 4-star combinations for squareness, vectorized on GPU.
+    """Score square candidates, vectorized on GPU.
     
-    Tests all 3 possible quadrilateral vertex orderings per combo and
-    picks the one that scores best as a square (proper closed shape)."""
+    Uses rotation-based diagonal pruning for N>80 to reduce O(N^4) to O(N^2).
+    Tests all 3 quadrilateral vertex orderings per candidate."""
     points_tensor = points_tensor.to(device)
 
     if mode == '3d':
@@ -342,9 +478,14 @@ def mass_score_square_torch(points_tensor, device='cpu', mode='3d', search_radiu
     else:
         scoring_coords = radecmag_to_angular(points_tensor)
 
-    idx_combinations = torch.combinations(torch.arange(scoring_coords.shape[0], device=device), r=4)
+    idx_combinations = _pruned_square_indices(scoring_coords)
 
-    # Get all 4-point groups: (N_combos, 4, 3)
+    if len(idx_combinations) == 0:
+        empty_scores = torch.zeros(0, device=device)
+        empty_points = torch.zeros((0, 4, 3), device=device)
+        return empty_scores, empty_points
+
+    # Get all 4-point groups: (N_combos, 4, D)
     combos = scoring_coords[idx_combinations]
     N = combos.shape[0]
     sqrt2 = math.sqrt(2.0)
@@ -559,8 +700,20 @@ def chain_extent_deg(points_tensor):
     return max_sep
 
 # %% ../nbs/01a_core.ipynb 12
+import gc
 from collections import defaultdict
 
+
+def _get_rss_gb():
+    """Current RSS in GB via /proc/self/status."""
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except Exception:
+        pass
+    return 0.0
 
 def _to_unit_vectors(stars_tensor):
     """Convert (RA_deg, Dec_deg, Vmag) to unit vectors on the celestial sphere."""
@@ -602,21 +755,41 @@ def _perpendicular_distance(unit_vecs, i_start, i_end):
     return perp_deg.pow(2).mean().sqrt().item(), perp_deg.max().item()
 
 
-def _batch_compute_angles(padded_stars, counts, device):
-    """Compute direction angle matrices for all regions in one GPU pass.
+def _batch_compute_angles(padded_stars, counts, device, k_angle=50):
+    """Compute direction angles to K nearest neighbors per star.
+    
+    Uses KNN-bounded approach: O(B*N*K) memory instead of O(B*N²).
+    Per-region KNN avoids allocating B*N*N distance matrices.
     
     Args:
         padded_stars: (B, max_N, 3) tensor of stars, zero-padded
         counts: (B,) int tensor of actual star counts per region
         device: GPU device
+        k_angle: number of nearest neighbors for angle computation
     Returns:
-        sorted_angles: (B, max_N, max_N) sorted angle values (CPU numpy)
-        sorted_indices: (B, max_N, max_N) sorted star indices (CPU numpy)
+        sorted_angles: (B, max_N, K) sorted angle values (CPU numpy)
+        sorted_indices: (B, max_N, K) sorted star indices (CPU numpy)
         unit_vecs: (B, max_N, 3) unit vectors (stays on GPU)
     """
     B, max_N, _ = padded_stars.shape
+    K = min(k_angle, max_N - 1)
 
     unit_vecs = _to_unit_vectors_batch(padded_stars)  # (B, N, 3)
+
+    # Compute KNN per region to avoid (B, N, N) distance matrix
+    all_knn = torch.zeros(B, max_N, K, dtype=torch.long, device=device)
+    for b in range(B):
+        n = int(counts[b])
+        if n < 4:
+            continue
+        uv_b = unit_vecs[b, :n]
+        dots = (uv_b @ uv_b.T).clamp(-1, 1)
+        dists_b = torch.sqrt(torch.clamp(2 - 2 * dots, min=0))
+        dists_b.fill_diagonal_(float('inf'))
+        k_b = min(K, n - 1)
+        _, topk_idx = torch.topk(dists_b, k_b, dim=1, largest=False)
+        all_knn[b, :n, :k_b] = topk_idx
+        del dots, dists_b, topk_idx
 
     ra_rad = torch.deg2rad(padded_stars[:, :, 0])   # (B, N)
     dec_rad = torch.deg2rad(padded_stars[:, :, 1])   # (B, N)
@@ -631,28 +804,41 @@ def _batch_compute_angles(padded_stars, counts, device):
         torch.cos(dec_rad),
     ], dim=2)
 
-    # Diffs: (B, N, N, 3) = unit_vecs[b,j] - unit_vecs[b,i]
-    diffs = unit_vecs.unsqueeze(1) - unit_vecs.unsqueeze(2)  # (B, N, N, 3)
+    # Gather neighbor unit vectors: (B, N, K, 3)
+    knn_flat = all_knn.reshape(B, max_N * K)  # (B, N*K)
+    neighbor_uv = torch.gather(
+        unit_vecs, 1,
+        knn_flat.unsqueeze(-1).expand(-1, -1, 3)
+    ).reshape(B, max_N, K, 3)
+    del knn_flat
 
-    # Project out radial component: radial_dot = dot(diffs[b,i,j], unit_vecs[b,i])
-    radial_dot = (diffs * unit_vecs.unsqueeze(2)).sum(dim=3, keepdim=True)  # (B, N, N, 1)
-    tangent = diffs - radial_dot * unit_vecs.unsqueeze(2)  # (B, N, N, 3)
+    # Direction from star i to each KNN neighbor: (B, N, K, 3)
+    diffs = neighbor_uv - unit_vecs.unsqueeze(2)
+    del neighbor_uv
+
+    # Project out radial component
+    radial_dot = (diffs * unit_vecs.unsqueeze(2)).sum(dim=3, keepdim=True)  # (B, N, K, 1)
+    tangent = diffs - radial_dot * unit_vecs.unsqueeze(2)  # (B, N, K, 3)
+    del diffs, radial_dot
 
     # Project onto tangent frames
-    tx = (tangent * east.unsqueeze(2)).sum(dim=3)   # (B, N, N)
-    ty = (tangent * north.unsqueeze(2)).sum(dim=3)  # (B, N, N)
-    angles = torch.atan2(ty, tx) % math.pi          # (B, N, N)
+    tx = (tangent * east.unsqueeze(2)).sum(dim=3)   # (B, N, K)
+    ty = (tangent * north.unsqueeze(2)).sum(dim=3)  # (B, N, K)
+    del tangent
+    angles = torch.atan2(ty, tx) % math.pi          # (B, N, K)
+    del tx, ty
 
-    # Mask out padding and self-diagonal: pi sorts to end of [0, pi) real values
+    # Mask padding: pi sorts to end
     for b in range(B):
-        n = counts[b]
+        n = int(counts[b])
+        k_b = min(K, n - 1)
         if n < max_N:
             angles[b, n:, :] = math.pi
-            angles[b, :, n:] = math.pi
-    diag_idx = torch.arange(max_N, device=device)
-    angles[:, diag_idx, diag_idx] = math.pi
+        if k_b < K:
+            angles[b, :n, k_b:] = math.pi
 
-    sorted_angles, sorted_indices = torch.sort(angles, dim=2)
+    sorted_angles, sort_perm = torch.sort(angles, dim=2)
+    sorted_indices = torch.gather(all_knn, 2, sort_perm)
 
     return sorted_angles.cpu().numpy(), sorted_indices.cpu().numpy(), unit_vecs
 
@@ -666,7 +852,7 @@ def _find_chains_batch(sa_cpu, si_cpu, counts_cpu, angle_tol_rad):
     
     Returns list of (region_b, chain_indices_tuple).
     """
-    B, max_N, _ = sa_cpu.shape
+    B, max_N, K = sa_cpu.shape
     all_candidates = []
 
     for b in range(B):
@@ -674,13 +860,12 @@ def _find_chains_batch(sa_cpu, si_cpu, counts_cpu, angle_tol_rad):
         if N < 4:
             continue
 
-        # After diagonal masking, positions 0..N-2 are other stars, N-1 is self
-        M = N - 1
+        M = min(K, N - 1)
         if M < 3:
             continue
 
-        # Extract this region's sorted angles and indices for all reference stars
-        block_a = sa_cpu[b, :N, :M]  # (N, M) - other stars only
+        # Extract this region's sorted angles and indices for KNN neighbors
+        block_a = sa_cpu[b, :N, :M]  # (N, M)
         block_i = si_cpu[b, :N, :M]  # (N, M)
 
         # Vectorized cluster detection: diff + cumsum for all rows at once
@@ -756,13 +941,15 @@ def _find_smooth_chains(uv_np, max_turn_deg=30.0, min_stars=4, k_neighbors=30):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     uv = torch.tensor(uv_np, dtype=torch.float32, device=device)
     
-    # Pairwise chord distances
+    # KNN via topk (avoids full N*N argsort)
     dots = uv @ uv.T
     dists = torch.sqrt(torch.clamp(2 - 2 * dots, min=0))
+    del dots
     dists.fill_diagonal_(float('inf'))
     
     k = min(k_neighbors, N - 1)
-    knn = torch.argsort(dists, dim=1)[:, :k]  # (N, k) — global star indices
+    _, knn = torch.topk(dists, k, dim=1, largest=False)  # (N, k)
+    del dists
     
     cos_max_turn = math.cos(math.radians(max_turn_deg))
     
@@ -933,12 +1120,12 @@ def _find_smooth_chains(uv_np, max_turn_deg=30.0, min_stars=4, k_neighbors=30):
         key = frozenset(full)
         if key not in seen:
             seen.add(key)
-            result_chains.append(tuple(sorted(full)))
+            result_chains.append(tuple(full))
     
     return result_chains
 
 
-SCORE_CUTOFFS = {'rms': 0.2, 'msd': 0.2}
+SCORE_CUTOFFS = {'rms': 0.2, 'msd': 0.2, 'snake': 1.5}
 
 
 def _batch_score_chains(chains_uv, chains_mag=None, max_mag=15.0):
@@ -1012,6 +1199,47 @@ def _batch_score_chains(chains_uv, chains_mag=None, max_mag=15.0):
     else:
         scores['smooth'] = turn_std + 0.2 * cv
         scores['smooth_mag'] = turn_std + 0.2 * cv
+
+    # Snake scoring: use ORIGINAL discovery order (not SVD-sorted) to preserve
+    # S-curve topology. SVD sorting scrambles curves by projecting onto principal axis.
+    if K >= 5:
+        snake_dirs = chains_uv[:, 1:] - chains_uv[:, :-1]  # original order
+        snake_dir_norms = torch.linalg.norm(snake_dirs, dim=2, keepdim=True).clamp(min=1e-12)
+        snake_dirs_n = snake_dirs / snake_dir_norms
+        snake_cos_turn = (snake_dirs_n[:, :-1] * snake_dirs_n[:, 1:]).sum(dim=2).clamp(-1, 1)
+        snake_turn_deg = torch.rad2deg(torch.acos(snake_cos_turn))
+
+        # Spacing CV from original order
+        snake_spacings = torch.acos((chains_uv[:, :-1] * chains_uv[:, 1:]).sum(dim=2).clamp(-1, 1))
+        snake_mean_sp = snake_spacings.mean(dim=1)
+        snake_std_sp = snake_spacings.std(dim=1)
+        snake_cv = torch.where(snake_mean_sp > 1e-12, snake_std_sp / snake_mean_sp, torch.zeros_like(snake_mean_sp))
+
+        # Alternation: cross products in original order
+        crosses = torch.cross(snake_dirs_n[:, :-1], snake_dirs_n[:, 1:], dim=2)
+        chain_normal = Vh[:, 2, :]  # (N, 3) - normal to best-fit plane
+        turn_sign = (crosses * chain_normal.unsqueeze(1)).sum(dim=2)
+        signs = torch.sign(turn_sign)
+        sign_changes = (signs[:, :-1] * signs[:, 1:] < 0).float()
+        alternation_ratio = sign_changes.mean(dim=1)  # 1.0 = perfect snake
+
+        # Turn amplitude regularity
+        turn_abs = snake_turn_deg.abs()
+        turn_mean = turn_abs.mean(dim=1)
+        turn_angle_cv = torch.where(turn_mean > 1e-12,
+                                     turn_abs.std(dim=1) / turn_mean,
+                                     torch.zeros_like(turn_mean))
+
+        # Penalize large mean turn angles (gentle S-curves preferred over zigzags)
+        turn_mag_penalty = ((turn_mean - 15.0) / 30.0).clamp(min=0.0)
+        # Hard filter: mean turn > 45° is zigzag, not snake
+        too_zigzag = turn_mean > 45.0
+
+        scores['snake'] = (1.0 - alternation_ratio) + 0.3 * turn_angle_cv + 0.2 * snake_cv + 0.4 * turn_mag_penalty
+        scores['snake'] = torch.where(too_zigzag, torch.tensor(999.0, device=device), scores['snake'])
+    else:
+        # Not enough turns for meaningful alternation — assign worst score
+        scores['snake'] = torch.full((N,), 999.0, device=device)
 
     return scores, sort_order
 def _chain_extent_batch(sorted_stars):
@@ -1089,9 +1317,12 @@ def process_collinear_regions(grid_points, gpu_catalog, config, device, max_exte
     """Process ALL regions for collinear/smooth chains in batched GPU passes.
     
     Phase 1: Filter regions on GPU
-    Phase 2a: Batch angle matrices on GPU + numpy chain finding (straight lines)
+    Phase 2a: KNN-bounded angle matrices on GPU + numpy chain finding (straight lines)
     Phase 2b: Greedy smooth chain finding (curves)
     Phase 3: Batch score all candidates on GPU, grouped by chain length
+    
+    Memory-bounded: stores stars as numpy arrays (not Python lists) and
+    periodically prunes accumulated results to top-50 per region/chain_len.
     """
     radius = config.search_radius_deg
     max_mag = config.max_mag
@@ -1131,13 +1362,7 @@ def process_collinear_regions(grid_points, gpu_catalog, config, device, max_exte
     actual_max_n = max(len(s) for _, s in region_stars)
     print(f"Phase 1 done: {B} regions with stars (max {actual_max_n}/region)")
 
-    # --- Phase 2a: Batch angle computation on GPU + chain finding (straight lines) ---
-    sub_batch_size = min(B, max(100, 4_000_000_000 // (actual_max_n * actual_max_n * 3 * 4)))
-    print(f"Phase 2a: Computing angle matrices (sub-batch={sub_batch_size}, N={actual_max_n})...")
-
-    all_candidates = []
-
-    # Build concatenated star + unit_vec tensors for Phase 3 lookup
+    # Build padded tensors for star data and grid indices
     concat_stars = torch.zeros(B, actual_max_n, 3, device=device)
     grid_indices = torch.zeros(B, dtype=torch.long, device=device)
     region_counts = torch.zeros(B, dtype=torch.long)
@@ -1145,125 +1370,220 @@ def process_collinear_regions(grid_points, gpu_catalog, config, device, max_exte
         concat_stars[b, :len(stars)] = stars
         grid_indices[b] = idx
         region_counts[b] = len(stars)
+    del region_stars
+    torch.cuda.empty_cache()
+    gc.collect()
 
-    concat_uv_parts = []
+    # --- Phases 2+3: Process in region chunks to limit memory ---
+    # KNN-bounded angles use O(B*N*K) instead of O(B*N²).
+    # Per-region KNN step uses O(N²) peak but processes one region at a time.
+    # Budget: ~1GB for angle tensors + KNN gather
+    k_angle = min(50, actual_max_n - 1)
+    angle_mem_per_region = actual_max_n * k_angle * 4 * 8  # tensors during angle computation
+    sub_batch_size = min(B, max(50, 1_000_000_000 // max(angle_mem_per_region, 1)))
+    print(f"Phases 2+3: Processing in chunks of {sub_batch_size} regions (N={actual_max_n}, K={k_angle})...")
 
-    for sb_start in tqdm.tqdm(range(0, B, sub_batch_size), desc="Angles"):
-        sb_end = min(sb_start + sub_batch_size, B)
-        sb_B = sb_end - sb_start
-
-        padded = concat_stars[sb_start:sb_end].clone()
-        counts = region_counts[sb_start:sb_end].clone()
-
-        sa, si, unit_vecs = _batch_compute_angles(padded, counts, device)
-        candidates = _find_chains_batch(sa, si, counts.numpy(), angle_tol_rad)
-
-        for b_local, chain_idx in candidates:
-            global_b = sb_start + b_local
-            all_candidates.append((global_b, chain_idx))
-
-        concat_uv_parts.append(unit_vecs.cpu())
-        del padded, sa, si, unit_vecs
-        torch.cuda.empty_cache()
-
-    # Concatenate unit vectors for Phase 3
-    concat_uv = torch.cat(concat_uv_parts, dim=0).to(device)
-    del concat_uv_parts
-
-    n_straight = len(all_candidates)
-    print(f"Phase 2a done: {n_straight:,} straight-line candidates")
-
-    # --- Phase 2b: Greedy smooth chain finding (curves) ---
-    print("Phase 2b: Finding smooth chains (curves)...")
-    seen_global = set()
-    for _, chain_idx in all_candidates:
-        seen_global.add(chain_idx)
-
-    n_smooth_new = 0
-    for b in tqdm.tqdm(range(B), desc="Smooth"):
-        n = int(region_counts[b])
-        if n < 4:
-            continue
-        uv_np = concat_uv[b, :n].cpu().numpy()
-        smooth_chains = _find_smooth_chains(uv_np, max_turn_deg=30.0, min_stars=4, k_neighbors=15)
-        for chain_idx in smooth_chains:
-            if chain_idx not in seen_global:
-                seen_global.add(chain_idx)
-                all_candidates.append((b, chain_idx))
-                n_smooth_new += 1
-
-    print(f"Phase 2b done: {n_smooth_new:,} new smooth candidates (total: {len(all_candidates):,})")
-
-    if not all_candidates:
-        return pl.DataFrame()
-
-    # --- Phase 3: Batch scoring grouped by chain length ---
-    print("Phase 3: Batch scoring on GPU...")
-    by_length = defaultdict(list)
-    for global_b, chain_idx in all_candidates:
-        by_length[len(chain_idx)].append((global_b, list(chain_idx)))
-    del all_candidates
-
-    score_keys = ['rms', 'msd', 'smooth', 'smooth_mag']
+    score_keys = ['rms', 'msd', 'smooth', 'smooth_mag', 'snake']
     all_results = {k: [] for k in score_keys}
     all_results_regions = []
     all_results_lens = []
-    all_results_stars = []
+    all_results_stars = []  # list of numpy arrays (K, 3) per chain
+    total_straight = 0
+    total_smooth = 0
+    total_scored = 0
+    chunks_since_prune = 0
+    PRUNE_INTERVAL = 5
 
-    for K in sorted(by_length.keys()):
-        group = by_length[K]
-        N_K = len(group)
-        print(f"  {K}-chains: {N_K:,}")
+    def _prune_accumulated():
+        """Compact accumulated results, keeping top-20 per region/chain_len.
 
-        # Process in sub-batches to limit GPU memory (~500K per batch)
-        score_batch_size = 500_000
-        for g_start in range(0, N_K, score_batch_size):
-            g_end = min(g_start + score_batch_size, N_K)
-            batch = group[g_start:g_end]
-            n_batch = len(batch)
+        Uses min rank across all scoring modes as proxy.  Final pass
+        keeps top-10, so 20 provides headroom for overlapping regions.
+        """
+        if not all_results_regions:
+            return
+        regions = np.concatenate(all_results_regions)
+        lens = np.concatenate(all_results_lens)
+        scores = {k: np.concatenate(all_results[k]) for k in score_keys}
+        n_total = len(regions)
+        if n_total < 50_000:
+            return
 
-            # Build index tensors for gathering
-            gb = torch.tensor([g[0] for g in batch], device=device, dtype=torch.long)
-            ci = torch.tensor([g[1] for g in batch], device=device, dtype=torch.long)
+        # Best rank across all scoring modes
+        best_rank = np.full(n_total, n_total, dtype=np.int64)
+        for k in score_keys:
+            cutoff = SCORE_CUTOFFS.get(k, 1.0)
+            valid = scores[k] <= cutoff
+            order = np.argsort(scores[k])
+            rank = np.empty(n_total, dtype=np.int64)
+            rank[order] = np.arange(n_total)
+            rank[~valid] = n_total
+            np.minimum(best_rank, rank, out=best_rank)
 
-            # Gather unit vectors and star coords: (n_batch, K, 3)
-            gb_exp = gb.unsqueeze(1).expand(-1, K)
-            uv_batch = concat_uv[gb_exp, ci]
-            stars_batch = concat_stars[gb_exp, ci]
+        # Keep top-20 per (region, chain_len)
+        TOP_K = 20
+        keep = np.zeros(n_total, dtype=bool)
+        keys = (regions.astype(np.int64) << 16) | lens.astype(np.int64)
+        for ukey in np.unique(keys):
+            mask = keys == ukey
+            idxs = np.where(mask)[0]
+            if len(idxs) <= TOP_K:
+                keep[idxs] = True
+            else:
+                topk = idxs[np.argpartition(best_rank[idxs], TOP_K)[:TOP_K]]
+                keep[topk] = True
 
-            # Gather magnitudes: (n_batch, K)
-            mag_batch = concat_stars[gb_exp, ci, 2]
+        n_kept = keep.sum()
+        if n_kept >= n_total * 0.9:
+            return
 
-            # Batch score on GPU
-            scores_dict, sort_orders = _batch_score_chains(uv_batch, chains_mag=mag_batch, max_mag=max_mag)
+        all_results_regions.clear()
+        all_results_regions.append(regions[keep])
+        all_results_lens.clear()
+        all_results_lens.append(lens[keep])
+        for k in score_keys:
+            all_results[k].clear()
+            all_results[k].append(scores[k][keep])
 
-            # Sort stars by position along chain
-            bidx = torch.arange(n_batch, device=device).unsqueeze(1).expand(-1, K)
-            sorted_stars = stars_batch[bidx, sort_orders]
+        old_stars = all_results_stars.copy()
+        all_results_stars.clear()
+        for i in np.where(keep)[0]:
+            all_results_stars.append(old_stars[i])
+        del old_stars
 
-            # Extent filter (vectorized, endpoint-based)
-            if max_extent is not None:
-                extents = _chain_extent_batch(sorted_stars)
-                mask = extents <= max_extent
-                for k in score_keys:
-                    scores_dict[k] = scores_dict[k][mask]
-                sorted_stars = sorted_stars[mask]
-                gb = gb[mask]
+        print(f"  Pruned {n_total:,} -> {n_kept:,} chains ({100*n_kept/n_total:.0f}%)")
+        gc.collect()
 
-            # Collect results (move to CPU)
-            n_kept = len(scores_dict['rms'])
-            if n_kept > 0:
-                for k in score_keys:
-                    all_results[k].append(scores_dict[k].cpu().numpy())
-                all_results_regions.append(grid_indices[gb].cpu().numpy())
-                all_results_lens.append(np.full(n_kept, K, dtype=np.int32))
-                stars_cpu = sorted_stars.cpu().numpy()
-                all_results_stars.extend(stars_cpu.tolist())
+    for sb_start in tqdm.tqdm(range(0, B, sub_batch_size), desc="Chunks"):
+        sb_end = min(sb_start + sub_batch_size, B)
+        sb_B = sb_end - sb_start
 
-            del uv_batch, stars_batch, scores_dict, sort_orders, sorted_stars, gb, ci, mag_batch
+        # Phase 2a: KNN-bounded angle computation + straight chain finding
+        padded = concat_stars[sb_start:sb_end].clone()
+        counts = region_counts[sb_start:sb_end].clone()
+
+        sa, si, unit_vecs = _batch_compute_angles(padded, counts, device, k_angle=k_angle)
+        candidates = _find_chains_batch(sa, si, counts.numpy(), angle_tol_rad)
+        del sa, si
+
+        chunk_candidates = []
+        for b_local, chain_idx in candidates:
+            global_b = sb_start + b_local
+            chunk_candidates.append((global_b, b_local, chain_idx))
+        del candidates
+        total_straight += len(chunk_candidates)
+
+        # Phase 2b: smooth chain finding for this chunk
+        seen = set()
+        for _, _, chain_idx in chunk_candidates:
+            seen.add(frozenset(chain_idx))
+
+        for b_local in range(sb_B):
+            n = int(counts[b_local])
+            if n < 4:
+                continue
+            uv_np = unit_vecs[b_local, :n].cpu().numpy()
+            smooth_chains = _find_smooth_chains(uv_np, max_turn_deg=30.0, min_stars=4, k_neighbors=15)
+            global_b = sb_start + b_local
+            for chain_idx in smooth_chains:
+                key = frozenset(chain_idx)
+                if key not in seen:
+                    seen.add(key)
+                    chunk_candidates.append((global_b, b_local, chain_idx))
+                    total_smooth += 1
+        del seen
+
+        if not chunk_candidates:
+            del padded, unit_vecs
             torch.cuda.empty_cache()
+            gc.collect()
+            continue
 
-    del concat_uv, concat_stars, by_length
+        # Phase 3: Score this chunk's candidates on GPU
+        by_length = defaultdict(list)
+        for global_b, b_local, chain_idx in chunk_candidates:
+            by_length[len(chain_idx)].append((global_b, b_local, list(chain_idx)))
+        del chunk_candidates
+
+        for K in sorted(by_length.keys()):
+            group = by_length[K]
+            N_K = len(group)
+
+            score_batch_size = 500_000
+            for g_start in range(0, N_K, score_batch_size):
+                g_end = min(g_start + score_batch_size, N_K)
+                batch = group[g_start:g_end]
+                n_batch = len(batch)
+
+                gb = torch.tensor([g[0] for g in batch], device=device, dtype=torch.long)
+                gb_local = torch.tensor([g[1] for g in batch], device=device, dtype=torch.long)
+                ci = torch.tensor([g[2] for g in batch], device=device, dtype=torch.long)
+
+                gb_exp = gb.unsqueeze(1).expand(-1, K)
+                gb_local_exp = gb_local.unsqueeze(1).expand(-1, K)
+                uv_batch = unit_vecs[gb_local_exp, ci]  # chunk-local indexing
+                stars_batch = concat_stars[gb_exp, ci]   # global indexing
+                mag_batch = concat_stars[gb_exp, ci, 2]
+
+                scores_dict, sort_orders = _batch_score_chains(uv_batch, chains_mag=mag_batch, max_mag=max_mag)
+
+                # SVD-sorted stars for extent filtering (endpoints are physical extremes)
+                bidx = torch.arange(n_batch, device=device).unsqueeze(1).expand(-1, K)
+                sorted_stars = stars_batch[bidx, sort_orders]
+
+                if max_extent is not None:
+                    extents = _chain_extent_batch(sorted_stars)
+                    mask = extents <= max_extent
+                    for k in score_keys:
+                        scores_dict[k] = scores_dict[k][mask]
+                    sorted_stars = sorted_stars[mask]
+                    stars_batch = stars_batch[mask]
+                    gb = gb[mask]
+
+                n_kept = len(scores_dict['rms'])
+                if n_kept > 0:
+                    for k in score_keys:
+                        all_results[k].append(scores_dict[k].cpu().numpy())
+                    all_results_regions.append(grid_indices[gb].cpu().numpy())
+                    all_results_lens.append(np.full(n_kept, K, dtype=np.int32))
+                    # Save in discovery order as numpy — preserves spatial path
+                    # for smooth/snake chains. SVD sort destroys S-curve topology.
+                    stars_cpu = stars_batch.cpu().numpy()
+                    for row in range(n_kept):
+                        all_results_stars.append(stars_cpu[row])
+                    total_scored += n_kept
+
+                del uv_batch, stars_batch, scores_dict, sort_orders, sorted_stars, gb, gb_local, ci, mag_batch, gb_local_exp
+                torch.cuda.empty_cache()
+
+                # Mid-chunk RSS check
+                if len(all_results_stars) > 100_000:
+                    rss_gb = _get_rss_gb()
+                    if rss_gb > 15:
+                        _prune_accumulated()
+                        gc.collect()
+                        chunks_since_prune = 0
+
+        del by_length, padded, unit_vecs
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # Periodically prune to bound memory
+        chunks_since_prune += 1
+        if chunks_since_prune >= PRUNE_INTERVAL:
+            _prune_accumulated()
+            chunks_since_prune = 0
+
+        # RSS-based emergency prune (prevent OOM on dense regions)
+        rss_gb = _get_rss_gb()
+        if rss_gb > 20:
+            print(f"  RSS {rss_gb:.1f} GB — emergency prune")
+            _prune_accumulated()
+            gc.collect()
+            chunks_since_prune = 0
+
+    del concat_stars
+    print(f"All chunks done: {total_straight:,} straight + {total_smooth:,} smooth candidates, {total_scored:,} scored")
 
     if not all_results_regions:
         print("Phase 3 done: 0 chains after extent filter")
@@ -1274,15 +1594,21 @@ def process_collinear_regions(grid_points, gpu_catalog, config, device, max_exte
 
     print(f"Phase 3 done: {len(regions_arr):,} chains after extent filter")
 
+    # Convert stars from numpy arrays to Polars list column
+    stars_as_lists = [s.tolist() for s in all_results_stars]
+    del all_results_stars
+
     result = pl.DataFrame({
         "score_rms": np.concatenate(all_results['rms']).astype(np.float64),
         "score_msd": np.concatenate(all_results['msd']).astype(np.float64),
         "score_smooth": np.concatenate(all_results['smooth']).astype(np.float64),
         "score_smooth_mag": np.concatenate(all_results['smooth_mag']).astype(np.float64),
+        "score_snake": np.concatenate(all_results['snake']).astype(np.float64),
         "region": regions_arr.astype(np.int64),
         "chain_len": lens_arr.astype(np.int32),
-        "stars": all_results_stars,
+        "stars": stars_as_lists,
     })
+    del stars_as_lists
 
     # Keep top 10 per region per chain_len, independently per scoring mode
     results = {}
@@ -1301,7 +1627,503 @@ def process_collinear_regions(grid_points, gpu_catalog, config, device, max_exte
 
     return results
 
+
 # %% ../nbs/01a_core.ipynb 14
+def compute_chain_corridor_flux(chain_stars, catalog_df, max_mag, corridor_mult=2.0):
+    """Compute flux ratio of chain stars vs all stars in a corridor around the chain.
+
+    Args:
+        chain_stars: list of [RA, Dec, Vmag] for chain stars
+        catalog_df: Polars DataFrame with RAmdeg, DEmdeg, Vmag columns
+        max_mag: limiting magnitude
+        corridor_mult: corridor width as multiple of mean inter-star spacing
+
+    Returns:
+        flux_ratio: chain flux / total corridor flux (1.0 = chain dominates)
+        mag_contrast: median(field_mags) - median(chain_mags) (positive = chain brighter)
+    """
+    pts = np.array(chain_stars)
+    chain_ra = pts[:, 0]
+    chain_dec = pts[:, 1]
+    chain_mag = pts[:, 2]
+
+    # Mean inter-star spacing (angular)
+    diffs = np.diff(pts[:, :2], axis=0)
+    # Correct RA spacing for declination
+    cos_dec = np.cos(np.radians(np.mean(chain_dec)))
+    diffs[:, 0] *= cos_dec
+    spacings = np.sqrt((diffs ** 2).sum(axis=1))
+    mean_spacing = spacings.mean() if len(spacings) > 0 else 0.1
+
+    corridor_width = mean_spacing * corridor_mult
+
+    # Bounding box of chain expanded by corridor
+    ra_min = chain_ra.min() - corridor_width / cos_dec
+    ra_max = chain_ra.max() + corridor_width / cos_dec
+    dec_min = chain_dec.min() - corridor_width
+    dec_max = chain_dec.max() + corridor_width
+
+    # Query catalog for corridor stars
+    corridor = catalog_df.filter(
+        (pl.col("RAmdeg") >= ra_min) & (pl.col("RAmdeg") <= ra_max) &
+        (pl.col("DEmdeg") >= dec_min) & (pl.col("DEmdeg") <= dec_max) &
+        (pl.col("Vmag") <= max_mag)
+    )
+
+    # Flux calculations
+    flux_chain = np.sum(10 ** (-0.4 * chain_mag))
+    if len(corridor) == 0:
+        return 1.0, 0.0
+
+    field_mags = corridor["Vmag"].to_numpy()
+    flux_field = np.sum(10 ** (-0.4 * field_mags))
+
+    flux_ratio = flux_chain / flux_field if flux_field > 0 else 1.0
+    mag_contrast = float(np.median(field_mags) - np.median(chain_mag))
+
+    return float(flux_ratio), mag_contrast
+
+
+def score_bright_isolated_chains(collinear_df, catalog_df, max_mag):
+    """Re-score collinear chains by brightness contrast against surrounding field.
+
+    Args:
+        collinear_df: DataFrame with 'score', 'stars', 'chain_len', 'region' columns
+        catalog_df: full star catalog DataFrame
+        max_mag: limiting magnitude
+
+    Returns:
+        DataFrame with 'bright_score', 'flux_ratio', 'mag_contrast' columns added
+    """
+    bright_scores = []
+    flux_ratios = []
+    mag_contrasts = []
+
+    for row in collinear_df.iter_rows(named=True):
+        chain_stars = row['stars']
+        flux_ratio, mag_contrast = compute_chain_corridor_flux(chain_stars, catalog_df, max_mag)
+        # Lower bright_score = better (chain dominates field and has good geometry)
+        geometric_score = row['score']
+        bright_score = geometric_score / (flux_ratio * (1.0 + 0.5 * max(mag_contrast, 0.0)))
+        bright_scores.append(bright_score)
+        flux_ratios.append(flux_ratio)
+        mag_contrasts.append(mag_contrast)
+
+    return collinear_df.with_columns([
+        pl.Series("bright_score", bright_scores),
+        pl.Series("flux_ratio", flux_ratios),
+        pl.Series("mag_contrast", mag_contrasts),
+    ])
+
+
+def _gnomonic_project(stars_radec, center_ra, center_dec):
+    """Project RA/Dec (degrees) to gnomonic tangent plane (x, y) in degrees.
+
+    Args:
+        stars_radec: (N, 2) tensor or array of [RA, Dec] in degrees
+        center_ra, center_dec: tangent point in degrees
+
+    Returns:
+        xy: (N, 2) tensor of tangent plane coordinates in degrees
+    """
+    ra = torch.deg2rad(stars_radec[:, 0])
+    dec = torch.deg2rad(stars_radec[:, 1])
+    ra0 = math.radians(center_ra)
+    dec0 = math.radians(center_dec)
+
+    cos_dec = torch.cos(dec)
+    sin_dec = torch.sin(dec)
+    cos_dec0 = math.cos(dec0)
+    sin_dec0 = math.sin(dec0)
+    delta_ra = ra - ra0
+
+    cos_c = sin_dec0 * sin_dec + cos_dec0 * cos_dec * torch.cos(delta_ra)
+    cos_c = cos_c.clamp(min=1e-12)
+
+    x = cos_dec * torch.sin(delta_ra) / cos_c
+    y = (cos_dec0 * sin_dec - sin_dec0 * cos_dec * torch.cos(delta_ra)) / cos_c
+
+    return torch.rad2deg(torch.stack([x, y], dim=1))
+
+
+def _circumcircle_batch(xy, triplet_indices):
+    """Compute circumscribed circle for batches of triangles in 2D.
+
+    Args:
+        xy: (N, 2) tensor of 2D point coordinates
+        triplet_indices: (M, 3) tensor of point indices
+
+    Returns:
+        centers: (M, 2) tensor of circle centers
+        radii: (M,) tensor of circle radii
+        valid: (M,) boolean tensor (False for degenerate triangles)
+    """
+    A = xy[triplet_indices[:, 0]]  # (M, 2)
+    B = xy[triplet_indices[:, 1]]
+    C = xy[triplet_indices[:, 2]]
+
+    D = 2.0 * (A[:, 0] * (B[:, 1] - C[:, 1]) +
+               B[:, 0] * (C[:, 1] - A[:, 1]) +
+               C[:, 0] * (A[:, 1] - B[:, 1]))
+
+    valid = D.abs() > 1e-12
+
+    # Avoid division by zero for degenerate triangles
+    D_safe = torch.where(valid, D, torch.ones_like(D))
+
+    A_sq = (A ** 2).sum(dim=1)
+    B_sq = (B ** 2).sum(dim=1)
+    C_sq = (C ** 2).sum(dim=1)
+
+    cx = (A_sq * (B[:, 1] - C[:, 1]) +
+          B_sq * (C[:, 1] - A[:, 1]) +
+          C_sq * (A[:, 1] - B[:, 1])) / D_safe
+    cy = (A_sq * (C[:, 0] - B[:, 0]) +
+          B_sq * (A[:, 0] - C[:, 0]) +
+          C_sq * (B[:, 0] - A[:, 0])) / D_safe
+
+    centers = torch.stack([cx, cy], dim=1)
+    radii = torch.sqrt((A[:, 0] - cx) ** 2 + (A[:, 1] - cy) ** 2)
+
+    return centers, radii, valid
+
+
+def _count_stars_on_circles(xy, centers, radii, tolerance_deg=0.005, batch_size=100_000,
+                           min_count=4):
+    """Count stars within tolerance of each circle, return only circles with >= min_count.
+
+    Uses squared-distance comparison to avoid expensive sqrt in the hot loop.
+
+    Args:
+        xy: (N, 2) tangent plane coordinates
+        centers: (M, 2) circle centers
+        radii: (M,) circle radii
+        tolerance_deg: absolute tolerance in degrees
+        batch_size: process circles in chunks to limit memory
+        min_count: minimum stars to keep a circle
+
+    Returns:
+        good_centers: (G, 2) centers of good circles
+        good_radii: (G,) radii of good circles
+        good_star_indices: list of G tensors of star indices
+    """
+    M = len(centers)
+    device = xy.device
+
+    # Phase 1: Count on GPU using squared distances (no sqrt needed)
+    all_counts = torch.zeros(M, dtype=torch.long, device=device)
+
+    for b_start in range(0, M, batch_size):
+        b_end = min(b_start + batch_size, M)
+        b_centers = centers[b_start:b_end]
+        b_radii = radii[b_start:b_end]
+
+        dx = xy[:, 0].unsqueeze(0) - b_centers[:, 0].unsqueeze(1)
+        dy = xy[:, 1].unsqueeze(0) - b_centers[:, 1].unsqueeze(1)
+        dist_sq = dx ** 2 + dy ** 2
+
+        tol = torch.clamp(0.01 * b_radii, min=tolerance_deg)
+        r_lo_sq = (b_radii - tol).clamp(min=0).unsqueeze(1) ** 2
+        r_hi_sq = (b_radii + tol).unsqueeze(1) ** 2
+        all_counts[b_start:b_end] = ((dist_sq >= r_lo_sq) & (dist_sq <= r_hi_sq)).sum(dim=1)
+
+        del dx, dy, dist_sq
+
+    # Phase 2: Collect indices only for good circles (much smaller set)
+    good_mask = all_counts >= min_count
+    good_idx = torch.where(good_mask)[0]
+
+    if len(good_idx) == 0:
+        return centers[:0], radii[:0], []
+
+    # Limit to top 500 by count for speed
+    if len(good_idx) > 500:
+        good_counts = all_counts[good_idx]
+        _, top_k = torch.topk(good_counts, 500)
+        good_idx = good_idx[top_k]
+
+    good_centers = centers[good_idx]
+    good_radii = radii[good_idx]
+
+    # Collect star indices: batch nonzero + split by row counts
+    dx = xy[:, 0].unsqueeze(0) - good_centers[:, 0].unsqueeze(1)  # (G, N)
+    dy = xy[:, 1].unsqueeze(0) - good_centers[:, 1].unsqueeze(1)
+    dists = torch.sqrt(dx ** 2 + dy ** 2)
+    tol = torch.clamp(0.01 * good_radii, min=tolerance_deg).unsqueeze(1)
+    on_circle = torch.abs(dists - good_radii.unsqueeze(1)) < tol  # (G, N) bool
+    row_counts = on_circle.sum(dim=1)
+    nz = torch.nonzero(on_circle)
+    if len(nz) > 0:
+        good_star_indices = list(torch.split(nz[:, 1], row_counts.tolist()))
+    else:
+        good_star_indices = [torch.tensor([], dtype=torch.long, device=device)] * len(good_idx)
+    del dx, dy, dists
+
+    return good_centers, good_radii, good_star_indices
+
+
+def _score_circle_candidates(xy, mags, candidates, search_radius_deg):
+    """Score circle/arc candidates.
+
+    Args:
+        xy: (N, 2) tangent plane coordinates
+        mags: (N,) magnitudes
+        candidates: list of dicts with 'center', 'radius', 'star_indices'
+        search_radius_deg: max search radius for filtering
+
+    Returns:
+        scored: list of dicts with added 'score', 'arc_fraction', 'n_stars'
+    """
+    scored = []
+    for cand in candidates:
+        star_idx = cand['star_indices']
+        if len(star_idx) < 4:
+            continue
+
+        center = cand['center']
+        radius = cand['radius']
+        pts = xy[star_idx]
+        star_mags = mags[star_idx]
+
+        # Radial deviation (normalized by radius)
+        dists = torch.sqrt(((pts - center) ** 2).sum(dim=1))
+        radial_devs = (dists - radius).abs() / radius
+        rms_radial = radial_devs.pow(2).mean().sqrt().item()
+
+        # Angular positions around circle
+        dx = pts[:, 0] - center[0]
+        dy = pts[:, 1] - center[1]
+        angles = torch.atan2(dy, dx)
+        sorted_angles, sort_idx = torch.sort(angles)
+
+        # Angular gaps between consecutive stars
+        gaps = sorted_angles[1:] - sorted_angles[:-1]
+        # Wrap-around gap
+        wrap_gap = (2 * math.pi) - (sorted_angles[-1] - sorted_angles[0])
+        all_gaps = torch.cat([gaps, wrap_gap.unsqueeze(0)])
+        gap_mean = all_gaps.mean()
+        gap_std = all_gaps.std()
+        angular_spacing_cv = (gap_std / gap_mean).item() if gap_mean > 1e-12 else 0.0
+
+        # Arc fraction: angular span / 2pi
+        arc_span = (sorted_angles[-1] - sorted_angles[0]).item()
+        if arc_span < 0:
+            arc_span += 2 * math.pi
+        arc_fraction = arc_span / (2 * math.pi)
+
+        # Combined score (lower = better)
+        # More stars allow more radial scatter — n_bonus rewards larger circles
+        n = len(star_idx)
+        n_bonus = math.log2(n / 4) if n > 4 else 0.0
+        raw_score = rms_radial + 0.3 * angular_spacing_cv + 0.3 * (1.0 - arc_fraction)
+        score = raw_score / (1.0 + 0.5 * n_bonus)
+
+        scored.append({
+            'score': score,
+            'center': center.cpu().numpy().tolist(),
+            'radius': radius,
+            'star_indices': star_idx,
+            'stars': torch.stack([
+                xy[star_idx[sort_idx], 0],
+                xy[star_idx[sort_idx], 1],
+                star_mags[sort_idx],
+            ], dim=1),
+            'n_stars': len(star_idx),
+            'arc_fraction': arc_fraction,
+            'radius_deg': radius,
+        })
+
+    return scored
+
+
+def _dedup_circles(candidates, merge_radius_frac=0.3):
+    """Cluster nearby circle centers and merge star sets.
+
+    Keeps the candidate with the best (lowest) score from each cluster.
+    """
+    if not candidates:
+        return []
+
+    # Sort by score
+    candidates.sort(key=lambda c: c['score'])
+    kept = []
+    used = set()
+
+    for i, cand in enumerate(candidates):
+        if i in used:
+            continue
+        kept.append(cand)
+        ci = np.array(cand['center'])
+        ri = cand['radius_deg']
+        for j in range(i + 1, len(candidates)):
+            if j in used:
+                continue
+            cj = np.array(candidates[j]['center'])
+            rj = candidates[j]['radius_deg']
+            dist = np.sqrt(((ci - cj) ** 2).sum())
+            # Merge if centers are close relative to radii
+            if dist < merge_radius_frac * (ri + rj):
+                used.add(j)
+
+    return kept
+
+
+def process_circle_regions(grid_points, gpu_catalog, config, device='cuda',
+                           max_extent=None, min_stars_on_circle=5):
+    """Find circles/arcs of stars across sky regions.
+
+    Uses GPU catalog tensor for fast region filtering (like collinear pipeline).
+    Optimized with squared-distance star counting and torch.combinations for
+    triplet generation.
+
+    Args:
+        grid_points: list of (idx, (ra, dec)) grid points
+        gpu_catalog: PyTorch tensor (N, 3+) on GPU with [RA, Dec, Vmag, ...]
+        config: SearchConfig
+        device: torch device
+        max_extent: max angular extent filter
+        min_stars_on_circle: minimum stars to form a circle candidate
+
+    Returns:
+        Polars DataFrame with score, region, stars, n_stars, radius_deg, arc_fraction
+    """
+    radius = config.search_radius_deg
+    max_mag = config.max_mag
+    max_stars = config.max_stars_per_region if config.max_stars_per_region else 200
+    min_radius = 0.02  # 1 arcmin minimum
+    max_radius = radius * 0.8
+
+    # Phase 1: GPU-based region filtering
+    print("Phase 1: Filtering regions on GPU...")
+    region_stars = []
+    for idx, point in tqdm.tqdm(grid_points, desc="Filter"):
+        ra, dec = point
+        mask = (
+            (gpu_catalog[:, 0] >= ra) & (gpu_catalog[:, 0] < ra + radius) &
+            (gpu_catalog[:, 1] >= dec) & (gpu_catalog[:, 1] < dec + radius) &
+            (gpu_catalog[:, 2] <= max_mag)
+        )
+        stars = gpu_catalog[mask]
+        if len(stars) >= min_stars_on_circle:
+            if max_stars > 0 and len(stars) > max_stars:
+                _, top_idx = torch.topk(stars[:, 2], max_stars, largest=False)
+                stars = stars[top_idx]
+            # Dedup near-identical coordinates
+            coords_rounded = torch.round(stars[:, :2] * 10000)
+            _, inv = torch.unique(coords_rounded, dim=0, return_inverse=True)
+            n_unique = inv.max().item() + 1
+            first_occ = torch.full((n_unique,), len(stars), dtype=torch.long, device=stars.device)
+            first_occ.scatter_reduce_(0, inv, torch.arange(len(stars), device=stars.device), reduce='amin')
+            stars = stars[first_occ]
+            if len(stars) >= min_stars_on_circle:
+                region_stars.append((idx, stars))
+
+    print(f"  {len(region_stars):,} regions with >= {min_stars_on_circle} stars")
+
+    if not region_stars:
+        return pl.DataFrame()
+
+    # Phase 2: Circle detection per region
+    all_results = []
+    n_regions = len(region_stars)
+
+    triplet_cache = {}
+    for reg_i, (idx, stars_t) in enumerate(region_stars):
+        if reg_i % 1000 == 0:
+            print(f"  Circle region {reg_i}/{n_regions}...")
+
+        N = len(stars_t)
+        ra_center = stars_t[:, 0].mean().item()
+        dec_center = stars_t[:, 1].mean().item()
+
+        # Project to tangent plane
+        xy = _gnomonic_project(stars_t[:, :2], ra_center, dec_center)
+        mags = stars_t[:, 2]
+
+        # Generate triplets on GPU (cached per N)
+        if N > 200:
+            # Random subsample for very dense regions
+            n_triplets = 1_300_000
+            idx_a = torch.randint(0, N, (n_triplets,), device=device)
+            idx_b = torch.randint(0, N, (n_triplets,), device=device)
+            idx_c = torch.randint(0, N, (n_triplets,), device=device)
+            valid_mask = (idx_a != idx_b) & (idx_b != idx_c) & (idx_a != idx_c)
+            triplet_indices = torch.stack([idx_a[valid_mask], idx_b[valid_mask], idx_c[valid_mask]], dim=1)
+        else:
+            if N not in triplet_cache:
+                triplet_cache[N] = torch.combinations(torch.arange(N, device=device), r=3)
+            triplet_indices = triplet_cache[N]
+
+        if len(triplet_indices) == 0:
+            continue
+
+        # Compute circumcircles
+        centers, radii_t, valid = _circumcircle_batch(xy, triplet_indices)
+
+        # Filter by radius range and validity
+        radius_mask = valid & (radii_t >= min_radius) & (radii_t <= max_radius)
+        if radius_mask.sum() == 0:
+            del xy, mags, triplet_indices, centers, radii_t
+            torch.cuda.empty_cache()
+            continue
+
+        centers = centers[radius_mask]
+        radii_t = radii_t[radius_mask]
+
+        # Quantize circles to reduce duplicates before expensive counting
+        quant = 0.01  # degrees (~36 arcsec)
+        keys = torch.round(torch.cat([centers, radii_t.unsqueeze(1)], dim=1) / quant)
+        _, inv = torch.unique(keys, dim=0, return_inverse=True)
+        n_uniq = inv.max().item() + 1
+        first_occ = torch.full((n_uniq,), len(centers), dtype=torch.long, device=device)
+        first_occ.scatter_reduce_(0, inv, torch.arange(len(centers), device=device), reduce='amin')
+        centers = centers[first_occ]
+        radii_t = radii_t[first_occ]
+
+        # Count stars on each circle, get only good ones
+        good_centers, good_radii, good_star_indices = _count_stars_on_circles(
+            xy, centers, radii_t, min_count=min_stars_on_circle)
+        if len(good_star_indices) == 0:
+            del xy, mags, triplet_indices, centers, radii_t
+            torch.cuda.empty_cache()
+            continue
+
+        candidates = []
+        for i in range(len(good_star_indices)):
+            candidates.append({
+                'center': good_centers[i],
+                'radius': good_radii[i].item(),
+                'star_indices': good_star_indices[i],
+                'radius_deg': good_radii[i].item(),
+            })
+
+        # Score and dedup
+        scored = _score_circle_candidates(xy, mags, candidates, radius)
+        deduped = _dedup_circles(scored)
+
+        # Keep top 5 per region
+        for cand in deduped[:5]:
+            star_idx = cand['star_indices']
+            star_list = stars_t[star_idx].cpu().numpy().tolist()
+            all_results.append({
+                'score': cand['score'],
+                'region': idx,
+                'stars': star_list,
+                'n_stars': cand['n_stars'],
+                'radius_deg': cand['radius_deg'],
+                'arc_fraction': cand['arc_fraction'],
+            })
+
+        del xy, mags, triplet_indices, centers, radii_t
+        torch.cuda.empty_cache()
+
+    if not all_results:
+        return pl.DataFrame()
+
+    return pl.DataFrame(all_results)
+
+
+# %% ../nbs/01a_core.ipynb 16
 def stars_for_point_and_radius(df, point, radius, max_mag):
     """ point is in the corner, not the center """
     ra, dec = point
@@ -1365,7 +2187,7 @@ resultdf = pl.DataFrame({
     "item": []
 })
 
-# %% ../nbs/01a_core.ipynb 16
+# %% ../nbs/01a_core.ipynb 18
 # Global GPU catalog cache
 _gpu_catalog = None
 
@@ -1439,35 +2261,13 @@ def process(stars, region, point, nr_stars, device='cpu'):
     resultdf = pl.DataFrame({
         "score": scores.cpu().numpy(), 
         "region": [region] * len(scores),
-        "points": points.cpu().numpy()
+        "stars": points.cpu().numpy()
     })
     final_result_df = resultdf.top_k(5, by="score", reverse=True)
     print(f"Processed {region=} - {point} for {len(stars)} stars, {len(scores):,} triangles")
     return final_result_df
 
-# %% ../nbs/01a_core.ipynb 18
-def add_to_result_and_save(resultdf, df: pl.DataFrame, filename):
-    print(f"Saving {len(df):,} results to {filename}")
-    has_tilt = "tilt" in df.columns
-    scores = df["score"].to_list()
-    regions = df["region"].to_list()
-    stars_col = [
-        entry if isinstance(entry, list) else entry.tolist()
-        for entry in df["points"].to_list()
-    ]
-    data = {
-        "score": scores,
-        "region": regions,
-        "stars": stars_col,
-    }
-    if has_tilt:
-        data["tilt"] = df["tilt"].to_list()
-    new_df = pl.DataFrame(data)
-    if not resultdf.is_empty():
-        new_df = pl.concat([resultdf, new_df])
-    new_df.write_parquet(filename)
-    return new_df
-
+# %% ../nbs/01a_core.ipynb 20
 schema = {
     "score": pl.Float64,
     "region": pl.Float64,
@@ -1475,7 +2275,8 @@ schema = {
     "tilt": pl.Float64,
 }
 
-# %% ../nbs/01a_core.ipynb 19
+
+# %% ../nbs/01a_core.ipynb 21
 def add_compact_score(df, max_extent_deg, max_mag):
     """Add compact_score column: re-ranks results favoring small, bright, tight patterns."""
     if df.is_empty():
@@ -1533,7 +2334,46 @@ def dedup_results(df):
     return df.sort("score")
 
 
-# %% ../nbs/01a_core.ipynb 21
+SHAPE_ABBREV = {
+    'triangle': 'tri', 'square': 'sq', 'circle': 'cir',
+    'smooth': 'smo', 'smooth_mag': 'smm', 'snake': 'snk',
+    'rms': 'rms', 'msd': 'msd', 'bright_line': 'brl',
+}
+
+def asterism_id(stars, shape, chain_len=None):
+    """Generate a unique hash-based ID for an asterism.
+
+    Format: {shape_abbrev}{chain_len}-{hash8}
+    e.g. tri-a3f9b2c1, smo8-7c1d4e90
+    """
+    coords = sorted((round(s[0], 4), round(s[1], 4)) for s in stars)
+    abbrev = SHAPE_ABBREV.get(shape, shape[:3])
+    key = f"{abbrev}:{coords}"
+    h = hashlib.sha256(key.encode()).hexdigest()[:8]
+    if chain_len and chain_len > 3:
+        return f"{abbrev}{chain_len}-{h}"
+    return f"{abbrev}-{h}"
+
+
+def assign_asterism_ids(df, shape):
+    """Add 'asterism_id' column to a results DataFrame.
+
+    Uses shape name (triangle/square/collinear/circle), not scoring mode,
+    so the same stars always get the same ID regardless of 2d/3d scoring.
+    For collinear, uses the scoring mode (smooth/snake/etc) since different
+    scoring modes find genuinely different chain orderings.
+    """
+    if df.is_empty():
+        return df.with_columns(pl.lit("").alias("asterism_id"))
+    ids = []
+    for row in df.iter_rows(named=True):
+        stars = row['stars']
+        chain_len = row.get('chain_len') or len(stars)
+        ids.append(asterism_id(stars, shape, chain_len))
+    return df.with_columns(pl.Series("asterism_id", ids))
+
+
+# %% ../nbs/01a_core.ipynb 23
 def _score_region(stars_tensor, device, use_hip=False, score_triangles_hip=None,
                   score_squares_hip=None, mode='3d', shape='triangle', max_extent_deg=None,
                   search_radius_deg=None):
@@ -1618,6 +2458,20 @@ def process_all_regions(grid, df, config=None, start=0, end=0, batch_size=100, n
         print(f"Shape: collinear (batched GPU pipeline)")
         print(f"Regions: {len(grid_points)}")
         return process_collinear_regions(grid_points, gpu_catalog, config, device, max_extent)
+
+    # --- Circle/Arc: dedicated circumcircle pipeline ---
+    if shape == 'circle':
+        if device != 'cuda':
+            print("No GPU -- circle detection requires CUDA")
+            return global_result
+        gpu_catalog = load_catalog_to_gpu(df, device)
+        gpu_name = torch.cuda.get_device_name(0)
+        config_name = config.name if config else "legacy"
+        print(f"GPU: {gpu_name}")
+        print(f"Config: {config_name} (mag<={max_mag}, radius={radius}deg, extent<={max_extent}deg, max_stars={max_stars})")
+        print(f"Shape: circle/arc")
+        print(f"Regions: {len(grid_points)}")
+        return process_circle_regions(grid_points, gpu_catalog, config, device, max_extent)
 
     # --- Triangle/Square: existing stream-based pipeline ---
     if device != 'cuda':
@@ -1737,7 +2591,7 @@ def process_all_regions(grid, df, config=None, start=0, end=0, batch_size=100, n
             batch_df = pl.DataFrame({
                 "score": scores_cat.cpu().numpy(),
                 "region": regions_cat.cpu().numpy(),
-                "points": points_cat.cpu().numpy(),
+                "stars": points_cat.cpu().numpy(),
                 "tilt": tilt_cat.cpu().numpy(),
             })
 

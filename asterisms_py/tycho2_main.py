@@ -20,7 +20,7 @@ from asterisms_py.core import (
     get_grid_points, get_grid_point_by_idx, get_region, get_center,
     ra_to_hms, resultdf,
     load_catalog_to_gpu, reset_gpu_catalog, filter_stars_on_gpu,
-    vectorized_filter_batch, process, add_to_result_and_save,
+    vectorized_filter_batch, process,
     process_all_regions, _score_region, _detect_gpu_backend,
     triangle_extent_deg, triangle_extent_deg_batch,
     chain_extent_deg, score_collinear_region, process_collinear_regions,

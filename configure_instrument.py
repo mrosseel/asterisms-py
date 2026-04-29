@@ -249,10 +249,11 @@ def main():
 
     _show_eyepiece_table(inst)
 
-    confirm = input("  Proceed? [Y/n]: ").strip().lower()
-    if confirm == 'n':
-        print("Aborted.")
-        return
+    if not args.yes:
+        confirm = input("  Proceed? [Y/n]: ").strip().lower()
+        if confirm == 'n':
+            print("Aborted.")
+            return
 
     run_name = args.run_name or inst.name
 
@@ -273,7 +274,8 @@ def _run_pipeline(inst):
     import torch
     from asterisms_py.core import (
         get_grid_points, reset_gpu_catalog,
-        process_all_regions, add_to_result_and_save, dedup_results,
+        process_all_regions, dedup_results,
+        score_bright_isolated_chains,
     )
 
     try:
@@ -318,6 +320,14 @@ def _run_pipeline(inst):
             col_cfg = replace(cfg, max_stars_per_region=150)
         runs.append((col_cfg, f"results/result_collinear_{cfg.name}", "collinear", "2d"))
 
+        # Circle/arc detection
+        circ_cfg = cfg
+        if cfg.search_radius_deg <= 1.0:
+            circ_cfg = replace(cfg, max_stars_per_region=150)
+        elif cfg.search_radius_deg <= 3.0:
+            circ_cfg = replace(cfg, max_stars_per_region=200)
+        runs.append((circ_cfg, f"results/result_circle_{cfg.name}", "circle", "2d"))
+
     total = len(runs)
     start_all = time.time()
 
@@ -326,12 +336,20 @@ def _run_pipeline(inst):
         result_filename = f"{base_name}{suffix}.parquet"
 
         if shape == 'collinear':
-            skip_file = result_filename.replace(".parquet", "_smooth.parquet")
+            # Skip only if all collinear outputs exist (including snake)
+            smooth_file = result_filename.replace(".parquet", "_smooth.parquet")
+            snake_file = result_filename.replace(".parquet", "_snake.parquet")
+            if os.path.exists(smooth_file) and os.path.exists(snake_file):
+                print(f"[{i+1}/{total}] SKIP collinear (smooth+snake exist)")
+                continue
+        elif shape == 'circle':
+            if os.path.exists(result_filename):
+                print(f"[{i+1}/{total}] SKIP {result_filename} (exists)")
+                continue
         else:
-            skip_file = result_filename
-        if os.path.exists(skip_file):
-            print(f"[{i+1}/{total}] SKIP {skip_file} (exists)")
-            continue
+            if os.path.exists(result_filename):
+                print(f"[{i+1}/{total}] SKIP {result_filename} (exists)")
+                continue
 
         grid_points = get_grid_points(config, -63, 63)
         print(f"\n{'=' * 60}")
@@ -358,14 +376,40 @@ def _run_pipeline(inst):
                     print(f"  Saved {fn} ({len(df_k):,} rows) [{elapsed:.0f}s]")
             else:
                 print(f"  No results [{elapsed:.0f}s]")
+        elif shape == 'circle':
+            print(f"  Results: {len(result)} [{elapsed:.0f}s]")
+            if not result.is_empty():
+                result = result.sort("score")
+                result.write_parquet(result_filename)
+                print(f"  Saved {result_filename} ({len(result):,} rows)")
         else:
             print(f"  Results: {len(result)} [{elapsed:.0f}s]")
             if not result.is_empty():
-                add_to_result_and_save(pl.DataFrame(), result, result_filename)
-                saved = pl.read_parquet(result_filename)
-                saved = dedup_results(saved)
-                saved.write_parquet(result_filename)
-                print(f"  Saved {result_filename} ({len(saved):,} rows)")
+                result = dedup_results(result)
+                result.sort("score").write_parquet(result_filename)
+                print(f"  Saved {result_filename} ({len(result):,} rows)")
+
+    # Post-processing: bright isolated lines from smooth collinear results
+    print("\n--- Post-processing: bright isolated lines ---")
+    for cfg in search_configs:
+        smooth_file = f"results/result_collinear_{cfg.name}_smooth.parquet"
+        bright_file = f"results/result_bright_line_{cfg.name}.parquet"
+        if os.path.exists(bright_file):
+            print(f"SKIP {bright_file} (exists)")
+            continue
+        if not os.path.exists(smooth_file):
+            print(f"SKIP {bright_file} (no smooth source: {smooth_file})")
+            continue
+        print(f"Scoring bright lines from {smooth_file}...")
+        smooth_df = pl.read_parquet(smooth_file)
+        bright_df = score_bright_isolated_chains(smooth_df, df, cfg.max_mag)
+        # Re-sort by bright_score and save with score column
+        bright_df = bright_df.with_columns(
+            pl.col("bright_score").alias("score")
+        ).drop("bright_score").sort("score")
+        bright_df = dedup_results(bright_df)
+        bright_df.write_parquet(bright_file)
+        print(f"  Saved {bright_file} ({len(bright_df):,} rows)")
 
     total_elapsed = time.time() - start_all
     print(f"\nPipeline done in {total_elapsed/60:.1f} minutes.")

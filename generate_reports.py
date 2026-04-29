@@ -13,6 +13,8 @@ import torch
 import pandas
 from PIL import Image, ImageOps
 
+import matplotlib
+matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.backends.backend_pdf import PdfPages
@@ -29,6 +31,8 @@ from asterisms_py.core import (
     DEFAULT_INSTRUMENT, instrument_search_configs,
     eyepiece_to_search_config, camera_to_search_config,
     InstrumentConfig, Eyepiece, Camera,
+    score_bright_isolated_chains,
+    asterism_id, assign_asterism_ids,
 )
 
 # --- Seasonal constants for 51 deg N ---
@@ -157,6 +161,38 @@ def fetch_poss_image(ra_deg, dec_deg, fov_deg):
         return None
 
 
+def _draw_circle_arc(ax, star_ras, star_decs, n_arc_points=100):
+    """Draw a best-fit circle arc through stars as a dashed line."""
+    if len(star_ras) < 3:
+        return
+    # Fit circle to star positions using least-squares
+    x = np.array(star_ras)
+    y = np.array(star_decs)
+    # Algebraic circle fit: (x-cx)^2 + (y-cy)^2 = r^2
+    A = np.column_stack([2 * x, 2 * y, np.ones_like(x)])
+    b = x ** 2 + y ** 2
+    try:
+        result = np.linalg.lstsq(A, b, rcond=None)
+        params = result[0]
+    except np.linalg.LinAlgError:
+        return
+    cx, cy = params[0], params[1]
+    r_sq = params[2] + cx ** 2 + cy ** 2
+    if r_sq <= 0:
+        return
+    r = np.sqrt(r_sq)
+    # Angular positions of stars around circle
+    angles = np.arctan2(y - cy, x - cx)
+    angle_min, angle_max = angles.min(), angles.max()
+    # Extend slightly beyond star positions
+    margin = 0.05 * (angle_max - angle_min)
+    theta = np.linspace(angle_min - margin, angle_max + margin, n_arc_points)
+    arc_x = cx + r * np.cos(theta)
+    arc_y = cy + r * np.sin(theta)
+    ax.plot(arc_x, arc_y, color='#ffdd44', linewidth=1.0, alpha=0.5,
+            linestyle='--', zorder=9)
+
+
 def _poss_edge_with_gap(ax, ra0, dec0, ra1, dec1, gap_frac=0.12):
     """Draw a line between two points with gaps near each endpoint."""
     dx = ra1 - ra0
@@ -198,10 +234,14 @@ def _draw_poss_overlay(ax, poss_img, center_ra, center_dec, fov_deg, focus_stars
         star_ras = [star_ras[k] for k in order]
         star_decs = [star_decs[k] for k in order]
 
-    n_edges = n - 1 if shape == 'collinear' else n
-    for i in range(n_edges):
-        j = (i + 1) if shape == 'collinear' else (i + 1) % n
-        _poss_edge_with_gap(ax, star_ras[i], star_decs[i], star_ras[j], star_decs[j])
+    if shape == 'circle':
+        # Draw dashed arc through the stars
+        _draw_circle_arc(ax, star_ras, star_decs)
+    else:
+        n_edges = n - 1 if shape == 'collinear' else n
+        for i in range(n_edges):
+            j = (i + 1) if shape == 'collinear' else (i + 1) % n
+            _poss_edge_with_gap(ax, star_ras[i], star_decs[i], star_ras[j], star_decs[j])
 
     ax.set_xlim(center_ra + ra_half, center_ra - ra_half)
     ax.set_ylim(center_dec - half, center_dec + half)
@@ -222,6 +262,21 @@ def _get_center(value):
     _, mean = get_mean(value)
     ra = Angle(degrees=mean[0].item())
     return position_of_radec(ra._hours, mean[1])
+
+
+def asterism_full_id(stars, shape, chain_len=None, con=None):
+    """Constellation-prefixed asterism ID: CON-shape-hash.
+
+    If con (3-letter abbreviation) is not provided, computes it from star centroid.
+    """
+    base_id = asterism_id(stars, shape, chain_len)
+    if not con:
+        pts = torch.tensor(stars) if not isinstance(stars, torch.Tensor) else stars
+        mean = pts.mean(dim=0)
+        ra = Angle(degrees=mean[0].item())
+        center = position_of_radec(ra._hours, mean[1].item())
+        con = constellation_at(center)
+    return f"{con}-{base_id}"
 
 
 def compute_solitary_score(focus_stars, center_ra, center_dec, extent_deg, max_mag, geom_score,
@@ -339,6 +394,24 @@ def enrich_results(head, max_mag=15.0):
     return head
 
 
+def add_full_ids(df, shape, scoring=None):
+    """Add 'asterism_id' column with constellation-prefixed IDs to enriched results.
+
+    For collinear shapes, uses scoring mode (smooth/snake/etc) as the ID shape
+    since different scoring modes find genuinely different chain orderings.
+    """
+    if df.is_empty():
+        return df.with_columns(pl.lit("").alias("asterism_id"))
+    id_shape = scoring if shape == 'collinear' and scoring else shape
+    ids = []
+    for row in df.iter_rows(named=True):
+        stars = row['stars']
+        chain_len = row.get('chain_len') or len(stars)
+        con = row.get('CON')
+        ids.append(asterism_full_id(stars, id_shape, chain_len, con=con))
+    return df.with_columns(pl.Series("asterism_id", ids))
+
+
 _bv_cache = {}
 
 def _lookup_bv_for_focus_stars(focus_stars):
@@ -420,6 +493,34 @@ def draw_focus_stars(ax, t, earth, projection, focus_stars, limiting_magnitude):
     return fs
 
 
+def _draw_circle_arc_projected(ax, xs, ys, n_arc_points=100):
+    """Draw best-fit circle arc in projected coordinates (x,y from stereographic)."""
+    if len(xs) < 3:
+        return
+    x = np.array(xs)
+    y = np.array(ys)
+    A = np.column_stack([2 * x, 2 * y, np.ones_like(x)])
+    b = x ** 2 + y ** 2
+    try:
+        result = np.linalg.lstsq(A, b, rcond=None)
+        params = result[0]
+    except np.linalg.LinAlgError:
+        return
+    cx, cy = params[0], params[1]
+    r_sq = params[2] + cx ** 2 + cy ** 2
+    if r_sq <= 0:
+        return
+    r = np.sqrt(r_sq)
+    angles = np.arctan2(y - cy, x - cx)
+    angle_min, angle_max = angles.min(), angles.max()
+    margin = 0.05 * (angle_max - angle_min)
+    theta = np.linspace(angle_min - margin, angle_max + margin, n_arc_points)
+    arc_x = cx + r * np.cos(theta)
+    arc_y = cy + r * np.sin(theta)
+    ax.plot(arc_x, arc_y, color='#ffdd44', linewidth=0.8, alpha=0.4,
+            linestyle='--', zorder=9, clip_on=True)
+
+
 def _draw_shape_edges(ax, fs_focus, limiting_magnitude, n_stars, shape='triangle', data_limit=1.0):
     """Draw polygon edges with gaps near each vertex so stars remain visible."""
     xs = list(fs_focus['x'])
@@ -442,6 +543,11 @@ def _draw_shape_edges(ax, fs_focus, limiting_magnitude, n_stars, shape='triangle
     fixed_gap_data = 0.0002  # fixed gap beyond marker edge
 
     size_lm = limiting_magnitude
+
+    # Circle/arc: draw dashed arc overlay
+    if shape == 'circle':
+        _draw_circle_arc_projected(ax, xs, ys)
+        return
 
     # Collinear chains: open path (no wrap-around); stars already sorted along the line
     n_edges = n_stars - 1 if shape == 'collinear' else n_stars
@@ -475,8 +581,16 @@ def _shape_edge_segments(stars, shape, gap_deg=0.02):
     For triangles: closed 0->1, 1->2, 2->0
     For squares: closed polygon sorted by angle from centroid
     For collinear: open 0->1, 1->2, ..., N-2->N-1
+    For circle: approximate arc as short segments between consecutive stars (sorted by angle)
     """
     pts = [(s[0], s[1]) for s in stars]
+    if shape == 'circle':
+        # Sort stars by angle from centroid, then connect as open path
+        cx = np.mean([p[0] for p in pts])
+        cy = np.mean([p[1] for p in pts])
+        angles = [np.arctan2(p[1] - cy, p[0] - cx) for p in pts]
+        order = np.argsort(angles)
+        pts = [pts[i] for i in order]
     if shape == 'square' and len(pts) == 4:
         cx = np.mean([p[0] for p in pts])
         cy = np.mean([p[1] for p in pts])
@@ -526,6 +640,7 @@ def generate_pifinder_list(enriched_results, outdir, name, shape='triangle', pif
         extent = chain_extent_deg(star_pts) if len(row['stars']) > 3 else triangle_extent_deg(star_pts)
         edge_segments = _shape_edge_segments(row['stars'], shape)
         extent_arcsec = extent * 3600.0
+        aid = row.get('asterism_id', f"{row.get('CON', 'UNK')} asterism #{ast_idx+1}")
 
         notes_parts = [f"score={score:.6f}"]
         if 'tilt' in row:
@@ -533,7 +648,7 @@ def generate_pifinder_list(enriched_results, outdir, name, shape='triangle', pif
         notes_parts.append(f"mags={','.join(f'{m:.1f}' for m in star_mags)}")
 
         obj = {
-            "name": f"{con} asterism #{ast_idx+1}",
+            "name": aid,
             "obj_type": "Ast",
             "ra": round(ra_deg, 6),
             "dec": round(dec_deg, 6),
@@ -590,17 +705,19 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
         has_isolation = 'isolation' in enriched_results.columns
         has_tilt = 'tilt' in enriched_results.columns
         has_solitary = 'solitary_score' in enriched_results.columns
+        has_id = 'asterism_id' in enriched_results.columns
         table_data = []
-        col_labels = ['Rank', 'Score', 'Constellation', 'RA', 'Dec']
+        col_labels = ['#', 'ID', 'Score', 'Constellation', 'RA', 'Dec']
         if has_solitary:
             col_labels.append('Solitary')
         if has_tilt:
             col_labels.append('Tilt')
         if has_isolation:
-            col_labels.append('Isolation')
+            col_labels.append('Iso')
         for idx, row in enumerate(enriched_results.iter_rows(named=True)):
+            aid = row.get('asterism_id', '') if has_id else ''
             row_data = [
-                str(idx + 1), f"{row['score']:.6f}", row['CONSTELLATION'],
+                str(idx + 1), aid, f"{row['score']:.4f}", row['CONSTELLATION'],
                 row['Rah_full'], row['Dec_full'],
             ]
             if has_solitary:
@@ -611,20 +728,26 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
                 row_data.append(str(row['isolation']))
             table_data.append(row_data)
 
-        col_widths = [0.06, 0.12, 0.18, 0.20, 0.20]
+        col_widths = [0.04, 0.20, 0.10, 0.16, 0.18, 0.18]
         if has_solitary:
             col_widths.append(0.10)
         if has_tilt:
-            col_widths.append(0.08)
+            col_widths.append(0.06)
         if has_isolation:
-            col_widths.append(0.08)
+            col_widths.append(0.06)
+        n_rows = len(table_data)
+        row_height = 0.035
+        table_height = (n_rows + 1) * row_height
+        table_top = 0.78 if not instrument_info else 0.75
+        table_bottom = table_top - table_height
+        table_bbox = [0.02, max(table_bottom, 0.18), 0.96, min(table_height, table_top - 0.18)]
         table = ax.table(cellText=table_data,
                          colLabels=col_labels,
-                         loc='center', cellLoc='center',
+                         cellLoc='center',
+                         bbox=table_bbox,
                          colWidths=col_widths)
         table.auto_set_font_size(False)
-        table.set_fontsize(9)
-        table.scale(1.0, 1.8)
+        table.set_fontsize(8)
         # Style table cells for dark mode
         for (row_idx, col_idx), cell in table.get_celld().items():
             cell.set_facecolor('#1a1a1a')
@@ -699,7 +822,8 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
                 ax_chart.xaxis.set_visible(False)
                 ax_chart.yaxis.set_visible(False)
                 ax_chart.set_aspect(1.0)
-                ax_chart.set_title(f"#{idx+1}: {entry['CONSTELLATION']}", fontsize=16,
+                chart_title = entry.get('asterism_id', f"#{idx+1}") if 'asterism_id' in entry else f"#{idx+1}"
+                ax_chart.set_title(f"{chart_title}  {entry['CONSTELLATION']}", fontsize=13,
                                    fontweight='bold', color='white')
                 ax_chart.tick_params(colors='white')
                 for spine in ax_chart.spines.values():
@@ -780,6 +904,26 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
                         else:
                             quality = "Fair"
                         score_desc = f"Score: {score:.6f}  ({quality} smooth+mag fit)\n  Turn std + 0.2*CV + 0.2*mag_gradient_std."
+                    elif 'snake' in scoring:
+                        if score < 0.2:
+                            quality = "Excellent"
+                        elif score < 0.5:
+                            quality = "Very good"
+                        elif score < 1.0:
+                            quality = "Good"
+                        else:
+                            quality = "Fair"
+                        score_desc = f"Score: {score:.6f}  ({quality} snake fit)\n  Alternation + 0.3*turn_CV + 0.2*spacing_CV (0 = perfect S-curve)."
+                    elif 'bright' in scoring:
+                        if score < 0.01:
+                            quality = "Excellent"
+                        elif score < 0.05:
+                            quality = "Very good"
+                        elif score < 0.15:
+                            quality = "Good"
+                        else:
+                            quality = "Fair"
+                        score_desc = f"Score: {score:.6f}  ({quality} bright isolation)\n  Geometric score / (flux_ratio * contrast)."
                     elif 'smooth' in scoring:
                         if score < 0.01:
                             quality = "Excellent"
@@ -826,6 +970,21 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
                         quality = "Poor"
                     score_desc = f"Score: {score:.6f}  ({quality} equilateral fit)\n  CV of three side lengths (0 = perfect)."
                     sep_line = f"  Side separations: {',  '.join(sep_labels)} deg"
+                elif shape == 'circle':
+                    if score < 0.1:
+                        quality = "Excellent"
+                    elif score < 0.3:
+                        quality = "Very good"
+                    elif score < 0.5:
+                        quality = "Good"
+                    else:
+                        quality = "Fair"
+                    arc_frac = entry.get('arc_fraction', 0)
+                    radius_deg = entry.get('radius_deg', 0)
+                    score_desc = (f"Score: {score:.6f}  ({quality} circle/arc fit)\n"
+                                  f"  RMS radial dev + spacing CV + arc coverage.")
+                    sep_line = (f"  {n_stars}-star arc,  radius: {radius_deg:.3f} deg,  "
+                                f"arc: {arc_frac*100:.0f}%")
                 else:
                     if score < 0.01:
                         quality = "Excellent"
@@ -890,7 +1049,9 @@ def generate_pdf(enriched_results, outdir, name, title, max_mag=15.0, fov_overri
                         f"End:   {sN_ra.hstr(places=0, warn=False)}  {sN_dec.dstr(places=0, warn=False)}  (mag {focus_stars[-1][2]:.1f})"
                     )
 
+                id_line = f"ID: {entry['asterism_id']}\n" if 'asterism_id' in entry else ""
                 info_text = (
+                    f"{id_line}"
                     f"Constellation: {entry['CONSTELLATION']}\n"
                     f"Center: RA {entry['Rah_full']},  Dec {entry['Dec_full']}\n"
                     f"\n"
@@ -1042,7 +1203,7 @@ def _build_instrument_modes(inst):
             ))
 
         # Collinear
-        for col_scoring in ("smooth", "smooth_mag"):
+        for col_scoring in ("smooth", "smooth_mag", "snake"):
             modes.append((
                 f"collinear/{col_scoring}/{tag}",
                 col_scoring,
@@ -1053,6 +1214,30 @@ def _build_instrument_modes(inst):
                 cfg,
                 ep,
             ))
+
+        # Bright isolated lines (post-processed from smooth collinear)
+        modes.append((
+            f"bright_line/{tag}",
+            "bright_line",
+            f"results/result_bright_line_{config_tag}.parquet",
+            cfg.max_mag,
+            f"{inst.name} {tag} bright lines",
+            "collinear",
+            cfg,
+            ep,
+        ))
+
+        # Circles/arcs
+        modes.append((
+            f"circles/{tag}",
+            "circle",
+            f"results/result_circle_{config_tag}_2d.parquet",
+            cfg.max_mag,
+            f"{inst.name} {tag} circles/arcs",
+            "circle",
+            cfg,
+            ep,
+        ))
 
     return modes
 
@@ -1112,6 +1297,14 @@ def _process_mode(subdir_path, scoring, filename, max_mag, display_name, shape,
         print(f"  Tilt filter (10\u00b0-60\u00b0): {before} \u2192 {len(df)} results")
 
     if shape == 'collinear' and 'chain_len' in df.columns:
+        # Snake chains require at least 5 stars for meaningful alternation
+        if scoring == 'snake':
+            before = len(df)
+            df = df.filter(pl.col("chain_len") >= 5)
+            print(f"  Snake filter (chain_len >= 5): {before} -> {len(df)} results")
+            if len(df) == 0:
+                print(f"  No snake chains with >= 5 stars")
+                return
         # Filter chains with duplicate stars (near-zero spacings)
         def _has_unique_stars(stars):
             coords = [(round(s[0], 4), round(s[1], 4)) for s in stars]
@@ -1127,6 +1320,7 @@ def _process_mode(subdir_path, scoring, filename, max_mag, display_name, shape,
     # Non-collinear: enrich top 500 once and reuse for both main report and solitary
     sorted_df = df.sort("score")
     all_enriched_500 = enrich_results(sorted_df.head(500), max_mag=max_mag)
+    all_enriched_500 = add_full_ids(all_enriched_500, shape)
     all_enriched = all_enriched_500.head(100)
     visible = filter_visible_51n(all_enriched)
 
@@ -1240,6 +1434,7 @@ def _process_collinear_mode(df, outdir, pifinder_outdir, scoring, max_mag,
     for clen in chain_lengths:
         clen_df = df.filter(pl.col("chain_len") == clen).sort("score")
         enriched = enrich_results(clen_df.head(100), max_mag=max_mag)
+        enriched = add_full_ids(enriched, shape, scoring)
         vis = filter_visible_51n(enriched)
         if len(vis) > 0:
             visible_per_clen[clen] = vis
@@ -1300,6 +1495,7 @@ def _process_collinear_mode(df, outdir, pifinder_outdir, scoring, max_mag,
     sorted_df = df.sort("score")
     diverse_500 = _diverse_top_n(sorted_df, n=500)
     all_enriched_500 = enrich_results(diverse_500, max_mag=max_mag)
+    all_enriched_500 = add_full_ids(all_enriched_500, shape, scoring)
     all_enriched = all_enriched_500.head(100)
     visible = filter_visible_51n(all_enriched)
     if len(visible) > 0:

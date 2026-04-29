@@ -29,3 +29,8 @@ output/
 .DS_Store
 nbdev-template*/
 cache/
+support/tycho2/
+support/tycho2_unzipped/
+support/*.partial
+star-charts/
+results/
